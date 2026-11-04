@@ -886,6 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="Codex CLI executable or command name (default: codex)",
     )
+    codex_cli.add_backend_arguments(parser)
     codex_cli.add_prompt_arguments(
         parser,
         default_template=DEFAULT_PROMPT_PATH,
@@ -907,6 +908,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        codex_cli.configure_backend(args)
         input_paths, whole_problems, exact_attempts = (
             common.direct_review_inputs(args.paths)
         )
@@ -1037,13 +1039,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if pending:
         try:
-            codex = codex_cli.resolve_codex_executable(args.codex)
+            codex = codex_cli.agent_executable(args)
             codex_version = codex_cli.read_codex_version(codex)
         except common.CodexError as exc:
             return codex_cli.report_error(parser, exc)
         print(
             f"Reviewing {len(pending)} attempt(s), with up to "
-            f"{min(args.jobs, len(pending))} Codex critic(s) at once."
+            f"{min(args.jobs, len(pending))} {codex_cli.backend_name()} "
+            "critic(s) at once."
         )
         finished_count = 0
 

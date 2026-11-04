@@ -5,7 +5,7 @@ const vm = require("node:vm");
 
 const source = readFileSync(`${__dirname}/../src/workbench_web/app.js`, "utf8");
 const functions = [
-  "latestJobRuns", "retryJob", "codexItems", "refreshCodexLogs",
+  "latestJobRuns", "retryJob", "copilotItem", "codexItems", "refreshCodexLogs",
   "separateWriteTasks", "taskRequests", "taskRequestOptions", "taskTargetsForRequest",
   "targetKey", "targetCountLabel", "reviewTask", "confirmTask", "collectDialogOptions",
   "saveProblemEditor", "configuredMemoryLimit", "renderMemoryControl",
@@ -250,6 +250,32 @@ test("Codex transcript updates items and keeps repeated IDs in later turns", () 
   assert.equal(items[0].aggregated_output, "done");
   assert.equal(items[1].text, "Hello");
   assert.equal(items[2].text, "failure");
+});
+
+test("Copilot transcript events become messages, tool calls, and usage", () => {
+  const context = vm.createContext({});
+  vm.runInContext(functions, context);
+  const events = [
+    { type: "loose_ends.copilot_started", invocation_id: "c1" },
+    { type: "session.start", data: {} },
+    { type: "assistant.message", data: { messageId: "m0", content: "", toolRequests: [] } },
+    { type: "tool.execution_start", data: { toolCallId: "t1", toolName: "powershell", arguments: { command: "ls" } } },
+    { type: "tool.shell_output", data: { toolCallId: "t1", text: "partial" } },
+    { type: "tool.execution_complete", data: { toolCallId: "t1", success: true, result: { content: "listing" } } },
+    { type: "tool.execution_start", data: { toolCallId: "t2", toolName: "view", arguments: { path: "a.txt" } } },
+    { type: "assistant.message", data: { messageId: "m1", content: "Done" } },
+    { type: "result", sessionId: "s", exitCode: 0 },
+    { type: "loose_ends.copilot_usage", usage: { input_tokens: 5 } },
+  ].map(value => JSON.stringify(value)).join("\n");
+  const items = context.codexItems(events);
+  assert.equal(items.map(item => item.type).join(","), "powershell,view,agent_message,usage");
+  assert.equal(items[0].command, "ls");
+  assert.equal(items[0].status, "completed");
+  assert.equal(items[0].aggregated_output, "listing");
+  assert.equal(items[1].command, "a.txt");
+  assert.equal(items[1].status, "in_progress");
+  assert.equal(items[2].text, "Done");
+  assert.equal(JSON.parse(items[3].text).input_tokens, 5);
 });
 
 test("shared transcript loader preserves report queries and pages both sources", async () => {

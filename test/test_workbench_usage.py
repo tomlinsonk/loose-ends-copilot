@@ -310,6 +310,27 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(self.total()["missingUsage"], 0)
         self.assertEqual(self.total()["tokens"], USAGE)
 
+    def test_copilot_turns_track_progress_and_count_each_invocation_once(self):
+        start = json.dumps({"type": "loose_ends.copilot_started", "invocation_id": "c1"}) + "\n"
+        body = json.dumps({"type": "assistant.message", "data": {"content": "x"}}) + "\n"
+        finish = (
+            json.dumps({"type": "result", "sessionId": "s1", "exitCode": 0}) + "\n"
+            + json.dumps({"type": "loose_ends.copilot_usage", "invocation_id": "c1",
+                          "session_id": "s1", "model": "gpt-6-astra", "usage": USAGE}) + "\n"
+        )
+        path = self.source("live/events", start + body, self.context(model=None))
+        self.assertEqual(self.total()["missingUsage"], 1)
+        with path.open("ab") as stream:
+            stream.write(finish.encode())
+        self.index.import_source(path, self.context(model=None))
+        self.source("installed/events.jsonl", start + body + finish)
+        total = self.total()
+        self.assertEqual(total["invocations"], 1)
+        self.assertEqual(total["missingUsage"], 0)
+        self.assertEqual(total["tokens"], USAGE)
+        self.assertEqual(total["models"], ["gpt-6-astra · standard"])
+        self.assertIsNotNone(total["estimatedCost"])
+
     def test_replacement_retains_history_and_restart_uses_database(self):
         path = self.source("events", events("first"))
         path.write_bytes(events("second").encode())
@@ -490,10 +511,19 @@ class UltrafastTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             codex_cli.ModelOptions(fast=True, ultrafast=True)
         argv = []
-        _common_arguments(argv, {"serviceTier": "ultrafast"})
-        self.assertEqual(argv, ["--ultrafast"])
+        _common_arguments(argv, {"backend": "codex", "serviceTier": "ultrafast"})
+        self.assertEqual(argv, ["--backend", "codex", "--ultrafast"])
         with self.assertRaises(PlanError):
             _common_arguments([], {"serviceTier": "typo"})
+        with self.assertRaisesRegex(PlanError, "Codex backend"):
+            _common_arguments([], {"serviceTier": "fast"})
+        with self.assertRaisesRegex(PlanError, "Copilot backend"):
+            _common_arguments([], {"backend": "copilot", "reasoningEffort": "ultra"})
+        with self.assertRaises(PlanError):
+            _common_arguments([], {"backend": "claude"})
+        argv = []
+        _common_arguments(argv, {"backend": "copilot", "model": "claude-sonnet-5"})
+        self.assertEqual(argv, ["--backend", "copilot", "--model", "claude-sonnet-5"])
         with patch.object(codex_cli, "codex_account_config_overrides", return_value=[]):
             command = codex_cli.build_exec_command(
                 codex="codex", workspace=Path.cwd(), prompt="p", schema_path=Path("schema.json"),

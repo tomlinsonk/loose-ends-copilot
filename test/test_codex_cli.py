@@ -18,6 +18,7 @@ import codex_cli
 
 class CodexCliTests(unittest.TestCase):
     def setUp(self):
+        codex_cli.select_backend("codex")
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.codex_home = Path(temporary.name)
@@ -571,6 +572,297 @@ name = "Ignored provider"
         self.assertEqual(completed.returncode, 126)
         self.assertTrue(structured)
         self.assertFalse(timed_out)
+
+
+class CopilotBackendTests(unittest.TestCase):
+    def setUp(self):
+        codex_cli.select_backend("copilot")
+        self.addCleanup(codex_cli.select_backend, "codex")
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def command(self, web_search="disabled", **options):
+        return codex_cli.build_copilot_command(
+            copilot="copilot",
+            workspace=self.root,
+            options=codex_cli.ModelOptions(**options),
+            usage_path=self.root / "usage.json",
+            web_search=web_search,
+        )
+
+    def test_command_runs_sandboxed_non_interactive_json_turn(self):
+        command = self.command(model="gpt-5.5", reasoning_effort="high")
+        for flag in (
+            "--allow-all-tools",
+            "--no-ask-user",
+            "--no-custom-instructions",
+            "--sandbox",
+            "--disable-builtin-mcps",
+        ):
+            self.assertIn(flag, command)
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
+        self.assertEqual(command[command.index("-C") + 1], str(self.root))
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.5")
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "high")
+        excluded = command[command.index("--excluded-tools") + 1:]
+        self.assertEqual(excluded, list(codex_cli.COPILOT_EXCLUDED_TOOLS))
+        self.assertIn("web_fetch", excluded)
+        self.assertIn("task", excluded)
+
+    def test_web_search_adds_only_the_github_search_tool(self):
+        command = self.command(web_search="live")
+        self.assertNotIn("--disable-builtin-mcps", command)
+        self.assertEqual(
+            command[command.index("--add-github-mcp-tool") + 1],
+            "web_search",
+        )
+        self.assertEqual(command[command.index("--disable-mcp-server") + 1], "githubiq")
+
+    def test_rejects_codex_only_options(self):
+        with self.assertRaisesRegex(codex_cli.CodexError, "Fast"):
+            self.command(fast=True)
+        with self.assertRaisesRegex(codex_cli.CodexError, "ultra"):
+            self.command(reasoning_effort="ultra")
+        args = argparse.Namespace(backend="copilot", review_ultrafast=True)
+        with self.assertRaisesRegex(codex_cli.CodexError, "--review-ultrafast"):
+            codex_cli.validate_backend_options(args)
+        args = argparse.Namespace(backend="codex", fast=True, reasoning_effort="ultra")
+        codex_cli.validate_backend_options(args)
+
+    def test_backend_arguments_select_and_forward_the_backend(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--codex", default="codex")
+        codex_cli.add_backend_arguments(parser)
+        args = parser.parse_args([])
+        self.assertEqual(args.backend, "copilot")
+        self.assertEqual(
+            codex_cli.backend_arguments(args),
+            ["--backend", "copilot", "--codex", "codex", "--copilot", "copilot"],
+        )
+        args = parser.parse_args(["--backend", "codex"])
+        codex_cli.configure_backend(args)
+        self.assertFalse(codex_cli.using_copilot())
+
+    def test_sandbox_settings_block_shell_network(self):
+        settings = codex_cli.copilot_sandbox_settings(
+            "disabled",
+            readonly_paths=["C:\\texlive\\2026"],
+        )["sandbox"]
+        self.assertTrue(settings["enabled"])
+        self.assertFalse(settings["allowBypass"])
+        self.assertTrue(settings["allowDevToolAccess"])
+        self.assertFalse(settings["userPolicy"]["network"]["allowOutbound"])
+        self.assertEqual(
+            settings["userPolicy"]["filesystem"]["readonlyPaths"],
+            ["C:\\texlive\\2026"],
+        )
+        self.assertNotIn("sandboxMcpServers", settings)
+        live = codex_cli.copilot_sandbox_settings("live", readonly_paths=[])
+        self.assertFalse(live["sandbox"]["sandboxMcpServers"])
+        self.assertNotIn("filesystem", live["sandbox"]["userPolicy"])
+
+    def test_readonly_paths_find_tex_root_and_extra_paths(self):
+        binary = self.root / "texlive" / "2026" / "bin" / "windows"
+        binary.mkdir(parents=True)
+        (self.root / "texlive" / "texmf-local").mkdir()
+        name = "latexmk.exe" if os.name == "nt" else "latexmk"
+        executable = binary / name
+        executable.write_text("", encoding="utf-8")
+        executable.chmod(0o755)
+        extra = self.root / "extra"
+        paths = codex_cli.copilot_readonly_paths({
+            "PATH": str(binary),
+            "PATHEXT": ".EXE",
+            codex_cli.COPILOT_READONLY_PATHS_ENV: str(extra),
+        })
+        self.assertEqual(
+            paths,
+            [
+                str(self.root / "texlive" / "2026"),
+                str(self.root / "texlive" / "texmf-local"),
+                str(extra),
+            ],
+        )
+
+    def test_isolated_home_keeps_only_account_config(self):
+        source = self.root / "source-home"
+        source.mkdir()
+        (source / "config.json").write_text(
+            "// comment\n"
+            + json.dumps({
+                "lastLoggedInUser": {"login": "octocat"},
+                "loggedInUsers": [{"login": "octocat"}],
+                "mcpServers": {"private": {}},
+            }),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {codex_cli.COPILOT_HOME_ENV: str(source)}):
+            home = codex_cli.prepare_copilot_home("disabled")
+        self.addCleanup(__import__("shutil").rmtree, home, True)
+        config = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(config), {"lastLoggedInUser", "loggedInUsers"})
+        settings = json.loads((home / "settings.json").read_text(encoding="utf-8"))
+        self.assertTrue(settings["sandbox"]["enabled"])
+
+    def test_result_event_completes_turn(self):
+        events = self.root / "events.jsonl"
+        result = self.root / "agent-result.json"
+        result.write_text("{}", encoding="utf-8")
+        events.write_text(
+            json.dumps({"type": "result", "sessionId": "s", "exitCode": 0}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(codex_cli.structured_turn_is_complete(events, result))
+        events.write_text(
+            json.dumps({"type": "result", "sessionId": "s", "exitCode": 1}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(codex_cli.structured_turn_is_complete(events, result))
+
+    def test_usage_event_reports_codex_comparable_tokens(self):
+        events = self.root / "events.jsonl"
+        events.write_text(
+            json.dumps({"type": "result", "sessionId": "session-1", "exitCode": 0})
+            + "\n",
+            encoding="utf-8",
+        )
+        usage = self.root / "usage.json"
+        usage.write_text(json.dumps({
+            "currentModel": "gpt-5.5",
+            "totalNanoAiu": 1234,
+            "totalPremiumRequestCost": 1,
+            "modelMetrics": {
+                "gpt-5.5": {"usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "cacheReadTokens": 60,
+                    "cacheWriteTokens": 10,
+                    "reasoningTokens": 5,
+                }},
+            },
+        }), encoding="utf-8")
+        codex_cli.append_copilot_usage_event(usage, events)
+        event = json.loads(events.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(event["type"], codex_cli.COPILOT_USAGE_EVENT)
+        self.assertEqual(event["session_id"], "session-1")
+        self.assertEqual(event["model"], "gpt-5.5")
+        self.assertEqual(event["nano_aiu"], 1234)
+        self.assertEqual(event["usage"], {
+            "input_tokens": 100,
+            "cached_input_tokens": 60,
+            "cache_write_input_tokens": 10,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
+        })
+        missing = self.root / "missing.json"
+        self.assertIsNone(codex_cli.copilot_usage_event(missing, events))
+
+    def test_recovers_result_from_final_message(self):
+        events = self.root / "events.jsonl"
+        result = self.root / "agent-result.json"
+        events.write_text(
+            "\n".join(
+                json.dumps({"type": "assistant.message", "data": {"content": text}})
+                for text in ("working", '```json\n{"status": "done"}\n```')
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        codex_cli.recover_copilot_result(events, result)
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8")), {"status": "done"})
+        result.write_text('{"status": "written"}', encoding="utf-8")
+        codex_cli.recover_copilot_result(events, result)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {"status": "written"},
+        )
+
+    def test_result_instructions_reference_workspace_files(self):
+        prompt = codex_cli.with_copilot_result_instructions(
+            "Do the task.",
+            workspace=self.root,
+            schema_path=self.root / "schema.json",
+            result_path=self.root / "agent-result.json",
+        )
+        self.assertTrue(prompt.startswith("Do the task."))
+        self.assertIn("`agent-result.json`", prompt)
+        self.assertIn("`schema.json`", prompt)
+
+    def test_detects_credit_errors(self):
+        events = self.root / "events.jsonl"
+        events.write_text(
+            json.dumps({
+                "type": "session.error",
+                "data": {"message": "You have exceeded your premium request limit."},
+            })
+            + "\n"
+            + json.dumps({
+                "type": "assistant.message",
+                "data": {"content": "quota exceeded is a phrase"},
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIn("premium request limit", codex_cli.agent_credit_error(events))
+        events.write_text(
+            json.dumps({"type": "assistant.message", "data": {"content": "quota exceeded"}})
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIsNone(codex_cli.agent_credit_error(events))
+
+    def test_structured_run_uses_isolated_home_and_folds_usage(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        schema = workspace / "schema.json"
+        schema.write_text("{}", encoding="utf-8")
+        seen = {}
+
+        def fake_run(command, *, prompt, environment, events, events_path, **_):
+            home = Path(environment[codex_cli.COPILOT_HOME_ENV])
+            seen["home"] = home
+            seen["command"] = command
+            seen["prompt"] = prompt
+            self.assertTrue((home / "settings.json").is_file())
+            usage = Path(command[command.index("--usage-output-file") + 1])
+            usage.write_text(json.dumps({
+                "currentModel": "gpt-5.5",
+                "modelMetrics": {"gpt-5.5": {"usage": {
+                    "inputTokens": 3,
+                    "outputTokens": 2,
+                }}},
+            }), encoding="utf-8")
+            for event in (
+                {"type": "assistant.message", "data": {"content": '{"ok": true}'}},
+                {"type": "result", "sessionId": "abc", "exitCode": 0},
+            ):
+                events.write(json.dumps(event) + "\n")
+            events.flush()
+            return subprocess.CompletedProcess(command, 0), True, False
+
+        with (
+            patch.object(codex_cli, "_run_codex_process", side_effect=fake_run),
+            patch.object(codex_cli, "wait_for_codex_launch_slot"),
+        ):
+            result = codex_cli.run_structured_codex(
+                codex="copilot",
+                workspace=workspace,
+                prompt="Solve it.",
+                schema_path=schema,
+                timeout_seconds=60,
+            )
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8")), {"ok": True})
+        self.assertEqual(seen["command"][0], "copilot")
+        self.assertIn("agent-result.json", seen["prompt"])
+        self.assertFalse(seen["home"].exists())
+        lines = (workspace / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        first, last = json.loads(lines[0]), json.loads(lines[-1])
+        self.assertEqual(first["type"], codex_cli.COPILOT_STARTED_EVENT)
+        self.assertEqual(last["type"], codex_cli.COPILOT_USAGE_EVENT)
+        self.assertEqual(last["invocation_id"], first["invocation_id"])
+        self.assertEqual(last["session_id"], "abc")
+        self.assertEqual(last["usage"]["input_tokens"], 3)
 
 
 if __name__ == "__main__":

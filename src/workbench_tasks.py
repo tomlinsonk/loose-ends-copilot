@@ -41,7 +41,7 @@ MAX_DRY_RUN_WORKERS = 4
 MIN_PRIORITY_LEVEL = -3
 MAX_PRIORITY_LEVEL = 3
 EDITABLE_TASK_OPTIONS = {
-    "codexHome", "model", "reasoningEffort", "fast", "serviceTier", "webSearch", "prompt",
+    "backend", "codexHome", "model", "reasoningEffort", "fast", "serviceTier", "webSearch", "prompt",
     "reviewModel", "reviewReasoningEffort", "reviewWebSearch", "reviewPrompt",
     "maxRounds", "review", "reviewTimeoutMinutes", "includeLiteratureResolved",
     "mode", "timeoutMinutes", "force", "recoverComplete", "authors", "title",
@@ -74,6 +74,7 @@ def task_cli_defaults() -> dict[str, dict[str, str]]:
         values = {
             "model": parser.get_default("model"),
             "reasoningEffort": parser.get_default("reasoning_effort"),
+            "backend": parser.get_default("backend"),
         }
         if "web_search" in destinations:
             values["webSearch"] = parser.get_default("web_search")
@@ -180,7 +181,7 @@ def populate_dry_run_previews(plan: dict) -> dict:
     units = plan.get("units", [])
     if not units:
         return plan
-    if plan.get("action") != "download":
+    if plan.get("action") != "download" and _backend(plan.get("options", {})) == "codex":
         environment = os.environ.copy()
         if plan.get("options", {}).get("codexHome"):
             environment["CODEX_HOME"] = plan["options"]["codexHome"]
@@ -386,6 +387,27 @@ def _choice(options: dict, name: str, allowed: tuple[str, ...], default: str) ->
     return str(value)
 
 
+def _backend(options: dict) -> str:
+    backend = options.get("backend") or codex_cli.DEFAULT_BACKEND
+    if backend not in codex_cli.BACKENDS:
+        raise PlanError("backend must be one of " + ", ".join(codex_cli.BACKENDS))
+    return backend
+
+
+def _reasoning_effort(options: dict, name: str, label: str) -> str | None:
+    effort = options.get(name)
+    if not effort:
+        return None
+    if effort not in codex_cli.REASONING_EFFORTS:
+        raise PlanError(f"invalid {label}")
+    if (
+        _backend(options) == "copilot"
+        and effort in codex_cli.COPILOT_UNSUPPORTED_REASONING_EFFORTS
+    ):
+        raise PlanError(f"{label} {effort} is not supported by the Copilot backend")
+    return effort
+
+
 def _common_arguments(
     argv: list[str],
     options: dict,
@@ -393,19 +415,21 @@ def _common_arguments(
     prompt: bool = True,
     web_search: bool = False,
 ) -> None:
+    backend = _backend(options)
+    if options.get("backend"):
+        argv.extend(("--backend", backend))
     if prompt and (value := _text(options, "prompt")) is not None:
         argv.extend(("--prompt", value))
     if value := _text(options, "model"):
         argv.extend(("--model", value))
-    effort = options.get("reasoningEffort")
-    if effort:
-        if effort not in codex_cli.REASONING_EFFORTS:
-            raise PlanError("invalid reasoning effort")
+    if effort := _reasoning_effort(options, "reasoningEffort", "reasoning effort"):
         argv.extend(("--reasoning-effort", effort))
     tier = options.get("serviceTier") or ("fast" if options.get("fast") is True else "standard")
     if tier not in {"standard", "fast", "ultrafast"}:
         raise PlanError("invalid service tier")
     if tier != "standard":
+        if backend == "copilot":
+            raise PlanError(f"the {tier} service tier is only available with the Codex backend")
         argv.append(f"--{tier}")
     if web_search:
         mode = options.get("webSearch")
@@ -420,10 +444,7 @@ def _review_arguments(argv: list[str], options: dict) -> None:
         argv.extend(("--review-prompt", value))
     if value := _text(options, "reviewModel"):
         argv.extend(("--review-model", value))
-    effort = options.get("reviewReasoningEffort")
-    if effort:
-        if effort not in codex_cli.REASONING_EFFORTS:
-            raise PlanError("invalid review reasoning effort")
+    if effort := _reasoning_effort(options, "reviewReasoningEffort", "review reasoning effort"):
         argv.extend(("--review-reasoning-effort", effort))
     mode = options.get("reviewWebSearch")
     if mode:

@@ -45,11 +45,15 @@ This workflow can be followed through two interfaces:
   The workbench uses these to do the actual work.
   You can also use them for scripting, batch processing, and direct control.
 
-The core that makes this all possible is the
-[Codex CLI](https://learn.chatgpt.com/docs/codex/cli).
-You need this installed, along with an OpenAI account
-(and ideally subscription).
-Loose Ends calls Codex to do all the LLM work.
+The core that makes this all possible is a coding-agent CLI.
+Loose Ends runs the
+[GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)
+by default, and still supports the
+[Codex CLI](https://learn.chatgpt.com/docs/codex/cli) with `--backend codex`
+(see [Agent backends](#agent-backends)).
+You need one of them installed and signed in.
+Loose Ends calls the agent CLI to do all the LLM work. Many file names, flags,
+and log labels still say "Codex"; they apply to whichever backend runs.
 
 Loose Ends itself is written in Python, plus JavaScript in the web app.
 The research CLI tools use only the Python standard library.
@@ -61,14 +65,54 @@ To use Loose Ends, install the following prerequisites if you haven't already:
 
 * [Python 3.11+](https://www.python.org/)
 * Python dependencies: `python -m pip install -r requirements.txt`
-* [Codex CLI](https://learn.chatgpt.com/docs/codex/cli), and run
-  `codex login` to authenticate your account
+* An agent CLI, signed in:
+  * [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)
+    (default): install it, then run `copilot login`.
+  * Or the [Codex CLI](https://learn.chatgpt.com/docs/codex/cli): run
+    `codex login`, and pass `--backend codex`.
 * LaTeX, such as [TeX Live](https://www.tug.org/texlive/), including `latexmk`,
   to write manuscripts
 
 If you're using Windows + Cygwin, you will get better performance out of
 Windows Python instead of Cygwin Python.  To do so, replace `python` with
 `py -3` in all instructions.
+
+## Agent backends
+
+Every agent-running command accepts `--backend copilot|codex`
+(default: `copilot`). The workbench task dialog has a matching **Agent CLI**
+setting. `--copilot PATH` and `--codex PATH` choose the executables.
+Nested runs, such as a solve's critic, use the same backend as their parent.
+
+With the Copilot backend, each agent turn runs as follows:
+
+* It runs headlessly (`copilot --output-format json`) with all tools
+  allowed and no prompts to the user, in the per-run workspace.
+* It gets a fresh temporary `COPILOT_HOME` that holds only a sandbox policy.
+  Your MCP servers, plugins, agents, and custom instructions are not loaded.
+  Authentication still comes from your normal `copilot login`.
+  The temporary home is deleted after the run.
+* Its shell commands run in Copilot's sandbox. They can write only to the
+  workspace and have no network access. The GitHub web-search tool is enabled
+  only when the task's web search is not `disabled`; `indexed` and `live`
+  behave the same.
+* The sandbox can read the toolchain directories it finds automatically,
+  including Python and TeX. If a tool needs another read-only path, add it to
+  `LOOSE_ENDS_COPILOT_READONLY_PATHS` (separated with `os.pathsep`).
+* On Windows, the Microsoft Store `python` alias cannot run inside the
+  sandbox. Put a python.org (or other non-Store) Python first on `PATH`.
+* The final structured result is validated against the same JSON schema used
+  for Codex. If the model replies with JSON instead of writing the result
+  file, the reply is recovered as the result.
+* Token counts, the model, and Copilot's request/AI-credit usage are added to
+  `events.jsonl`. The workbench usage view counts them like Codex turns.
+  Cost estimates are API-equivalent, and only for models with known rates.
+
+Some options are Codex-only. Copilot rejects `--fast`, `--ultrafast`, and
+reasoning effort `ultra`. It also ignores `CODEX_HOME`.
+
+The Copilot backend is newer and has had less real-world use than Codex. In
+particular, Copilot quota and credit errors are recognized only heuristically.
 
 ## Quickstart
 
@@ -454,10 +498,11 @@ provenance, the ordered paper-author list, and a machine-readable index of the
 `OP-###` entries. The JSONL event stream and stderr log are retained for
 diagnostics.
 
-Install and authenticate the Codex CLI first, then analyze one paper:
+Install and sign in to an agent CLI first (see [Agent backends](#agent-backends)),
+then analyze one paper:
 
 ```sh
-codex login
+copilot login
 python src/analyze_papers.py papers/edemaine/arXiv-0705.4085v1
 ```
 
@@ -1151,9 +1196,10 @@ interrupted and runs that installed no output can be retried. A run that
 installed output before a later phase failed is marked partial so the next
 action can operate on that output without accidentally duplicating it.
 
-In **Activity**, expand **Codex transcript** for a read-only
-transcript: Codex messages appear as Markdown, with expandable task prompts,
-tool activity, and diagnostics. Transcripts refresh while the run is active.
+In **Activity**, expand **Show agent transcript** for a read-only
+transcript: agent messages appear as Markdown, with expandable task prompts,
+tool activity, and diagnostics. Codex and Copilot event logs both render here.
+Transcripts refresh while the run is active.
 The **command & output** fold opens independently.
 Each problem also has a **Full reports → Codex logs** tab for the selected
 attempt's saved solution/review logs and the problem's triage/literature logs.
