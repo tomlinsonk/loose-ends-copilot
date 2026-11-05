@@ -94,8 +94,13 @@ With the Copilot backend, each agent turn runs as follows:
   The temporary home is deleted after the run.
 * Its shell commands run in Copilot's sandbox. They can write only to the
   workspace and have no network access. The GitHub web-search tool is enabled
-  only when the task's web search is not `disabled`; `indexed` and `live`
-  behave the same.
+  only when the task's web search is not `disabled`. `live` also adds a
+  `fetch_url` tool (`src/copilot_fetch_mcp.py`). It runs outside the sandbox,
+  so agents can read web pages and save files such as arXiv sources into the
+  workspace, while shell commands stay offline. It accepts only http(s) URLs,
+  and only those that resolve to public addresses, so the workbench and the
+  local network cannot be reached. Copilot's built-in `web_fetch` stays off,
+  because on Windows enabling it would also open the sandbox's local network.
 * Credential-like environment variables (names containing `TOKEN`, `SECRET`,
   `PASSWORD`, `API_KEY`, and similar, plus `GH_TOKEN`, `GITHUB_TOKEN`, and
   `COPILOT_GITHUB_TOKEN`) are passed to `--secret-env-vars`. Copilot can still

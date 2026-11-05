@@ -52,6 +52,10 @@ COPILOT_EXCLUDED_TOOLS = (
     "semantic_code_search",
     "web_fetch",
 )
+# Live web search adds this unsandboxed MCP server so agents can read pages
+# while shell commands stay offline; it refuses local and private addresses.
+COPILOT_FETCH_SERVER = "loose-ends-fetch"
+COPILOT_FETCH_SERVER_PATH = Path(__file__).resolve().with_name("copilot_fetch_mcp.py")
 COPILOT_HOME_ENV = "COPILOT_HOME"
 # Copilot may authenticate with these, so they stay in its own environment;
 # --secret-env-vars strips them and other credentials from agent shells.
@@ -1485,6 +1489,24 @@ def copilot_secret_env_vars(environment: Mapping[str, str]) -> list[str]:
     return sorted(names)
 
 
+def copilot_fetch_mcp_config(workspace: Path) -> dict:
+    """Describe the page-fetch MCP server for one live-web-search run."""
+    return {
+        "mcpServers": {
+            COPILOT_FETCH_SERVER: {
+                "type": "local",
+                "command": sys.executable,
+                "args": [
+                    str(COPILOT_FETCH_SERVER_PATH),
+                    "--workspace",
+                    str(Path(workspace).resolve()),
+                ],
+                "tools": ["*"],
+            }
+        }
+    }
+
+
 def build_copilot_command(
     *,
     copilot: str,
@@ -1531,6 +1553,10 @@ def build_copilot_command(
                 "--add-github-mcp-tool",
                 "web_search",
             )
+        )
+    if web_search == "live":
+        command.extend(
+            ("--additional-mcp-config", json.dumps(copilot_fetch_mcp_config(workspace)))
         )
     if options.model is not None:
         command.extend(("--model", options.model))

@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import codex_cli
+import copilot_fetch_mcp
 
 
 class CodexCliTests(unittest.TestCase):
@@ -574,6 +575,58 @@ name = "Ignored provider"
         self.assertFalse(timed_out)
 
 
+class CopilotFetchServerTests(unittest.TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def test_refuses_local_and_private_addresses(self):
+        for host in ("127.0.0.1", "localhost", "10.1.2.3", "192.168.0.1", "169.254.169.254", "::1"):
+            with self.assertRaisesRegex(copilot_fetch_mcp.FetchError, "non-public"):
+                copilot_fetch_mcp.public_address(host, 80)
+        for url in ("file:///etc/passwd", "ftp://example.com/", "http://user:pw@example.com/"):
+            with self.assertRaises(copilot_fetch_mcp.FetchError):
+                copilot_fetch_mcp.fetch(url)
+
+    def test_save_as_stays_inside_the_workspace(self):
+        saved = copilot_fetch_mcp.save_body(self.root, "papers/a.pdf", b"%PDF-")
+        self.assertEqual(saved.read_bytes(), b"%PDF-")
+        for path in ("../escape", "a/../../escape", str(self.root / "abs"), "."):
+            with self.assertRaises(copilot_fetch_mcp.FetchError):
+                copilot_fetch_mcp.save_body(self.root, path, b"x")
+        self.assertFalse((self.root.parent / "escape").exists())
+
+    def test_html_becomes_text_with_absolute_links(self):
+        html = b"<html><head><script>x()</script></head><body><h1>Title</h1><p>See <a href='/abs/1'>paper</a>.</p></body></html>"
+        text = copilot_fetch_mcp.body_text("https://arxiv.org/list", "text/html", html)
+        self.assertIn("Title", text)
+        self.assertIn("paper <https://arxiv.org/abs/1>", text)
+        self.assertNotIn("x()", text)
+        self.assertIsNone(copilot_fetch_mcp.body_text("u", "application/pdf", b"%PDF-\0"))
+
+    def test_serves_mcp_over_stdio(self):
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "fetch_url", "arguments": {"url": "http://127.0.0.1:9/"}}},
+        ]
+        output = StringIO()
+        copilot_fetch_mcp.serve(
+            self.root, StringIO("".join(json.dumps(r) + "\n" for r in requests)), output
+        )
+        replies = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
+        self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual(
+            [tool["name"] for tool in replies[1]["result"]["tools"]], ["fetch_url"]
+        )
+        self.assertTrue(replies[2]["result"]["isError"])
+        self.assertIn("non-public", replies[2]["result"]["content"][0]["text"])
+
+
 class CopilotBackendTests(unittest.TestCase):
     def setUp(self):
         codex_cli.select_backend("copilot")
@@ -651,6 +704,23 @@ class CopilotBackendTests(unittest.TestCase):
             "web_search",
         )
         self.assertEqual(command[command.index("--disable-mcp-server") + 1], "githubiq")
+
+    def test_live_web_search_adds_the_public_fetch_server(self):
+        command = self.command(web_search="live")
+        config = json.loads(command[command.index("--additional-mcp-config") + 1])
+        server = config["mcpServers"][codex_cli.COPILOT_FETCH_SERVER]
+        self.assertEqual(server["command"], sys.executable)
+        self.assertEqual(
+            server["args"],
+            [str(codex_cli.COPILOT_FETCH_SERVER_PATH), "--workspace", str(self.root)],
+        )
+        self.assertTrue(codex_cli.COPILOT_FETCH_SERVER_PATH.is_file())
+        self.assertLess(
+            command.index("--additional-mcp-config"), command.index("--excluded-tools")
+        )
+        self.assertIn("web_fetch", command[command.index("--excluded-tools") + 1:])
+        for web_search in ("disabled", "indexed"):
+            self.assertNotIn("--additional-mcp-config", self.command(web_search=web_search))
 
     def test_rejects_codex_only_options(self):
         with self.assertRaisesRegex(codex_cli.CodexError, "Fast"):
