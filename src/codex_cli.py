@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import re
 import signal
 import shutil
 import subprocess
@@ -52,6 +53,14 @@ COPILOT_EXCLUDED_TOOLS = (
     "web_fetch",
 )
 COPILOT_HOME_ENV = "COPILOT_HOME"
+# Copilot may authenticate with these, so they stay in its own environment;
+# --secret-env-vars strips them and other credentials from agent shells.
+COPILOT_AUTH_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+COPILOT_SECRET_ENV_PATTERN = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|API_?KEY|ACCESS_?KEY"
+    r"|PRIVATE_?KEY|CONNECTION_?STRING|^COPILOT_GH_ACCOUNT_",
+    re.IGNORECASE,
+)
 COPILOT_ACCOUNT_CONFIG_KEYS = ("lastLoggedInUser", "loggedInUsers")
 COPILOT_READONLY_PATHS_ENV = "LOOSE_ENDS_COPILOT_READONLY_PATHS"
 COPILOT_USAGE_EVENT = "loose_ends.copilot_usage"
@@ -1465,6 +1474,17 @@ def prepare_copilot_home(web_search: str = "disabled") -> Path:
     return home
 
 
+def copilot_secret_env_vars(environment: Mapping[str, str]) -> list[str]:
+    """Name credential-like variables to hide from Copilot's agent shells."""
+    names = {
+        name
+        for name in environment
+        if COPILOT_SECRET_ENV_PATTERN.search(name) and "," not in name
+    }
+    names.update(COPILOT_AUTH_ENV_VARS)
+    return sorted(names)
+
+
 def build_copilot_command(
     *,
     copilot: str,
@@ -1472,6 +1492,7 @@ def build_copilot_command(
     options: ModelOptions,
     usage_path: Path,
     web_search: str = "disabled",
+    environment: Mapping[str, str] | None = None,
 ) -> list[str]:
     if web_search not in WEB_SEARCH_MODES:
         raise CodexError(
@@ -1515,6 +1536,8 @@ def build_copilot_command(
         command.extend(("--model", options.model))
     if options.reasoning_effort is not None:
         command.extend(("--reasoning-effort", options.reasoning_effort))
+    environment = os.environ if environment is None else environment
+    command.append("--secret-env-vars=" + ",".join(copilot_secret_env_vars(environment)))
     # Variadic, so it stays last; the prompt is read from standard input.
     command.extend(("--excluded-tools", *COPILOT_EXCLUDED_TOOLS))
     return command
@@ -1835,6 +1858,7 @@ def _run_structured_turn(
             options=options,
             usage_path=usage_path,
             web_search=web_search,
+            environment=environment,
         )
         environment[COPILOT_HOME_ENV] = str(copilot_home)
     else:

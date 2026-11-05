@@ -96,6 +96,11 @@ With the Copilot backend, each agent turn runs as follows:
   workspace and have no network access. The GitHub web-search tool is enabled
   only when the task's web search is not `disabled`; `indexed` and `live`
   behave the same.
+* Credential-like environment variables (names containing `TOKEN`, `SECRET`,
+  `PASSWORD`, `API_KEY`, and similar, plus `GH_TOKEN`, `GITHUB_TOKEN`, and
+  `COPILOT_GITHUB_TOKEN`) are passed to `--secret-env-vars`. Copilot can still
+  authenticate with them, but its shell commands do not see their values and
+  they are redacted from output.
 * The sandbox can read the toolchain directories it finds automatically,
   including Python and TeX. If a tool needs another read-only path, add it to
   `LOOSE_ENDS_COPILOT_READONLY_PATHS` (separated with `os.pathsep`).

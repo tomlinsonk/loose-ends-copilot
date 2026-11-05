@@ -610,6 +610,39 @@ class CopilotBackendTests(unittest.TestCase):
         self.assertIn("web_fetch", excluded)
         self.assertIn("task", excluded)
 
+    def test_command_hides_credentials_from_agent_shells(self):
+        environment = {
+            "PATH": "bin",
+            "OPENAI_API_KEY": "x",
+            "AWS_SECRET_ACCESS_KEY": "x",
+            "MY_SERVICE_TOKEN": "x",
+            "COPILOT_GH_ACCOUNT_GITHUB_2E_COM_USER": "x",
+            "GIT_CONFIG_KEY_0": "x",
+            "HOME": "x",
+        }
+        command = codex_cli.build_copilot_command(
+            copilot="copilot",
+            workspace=self.root,
+            options=codex_cli.ModelOptions(),
+            usage_path=self.root / "usage.json",
+            environment=environment,
+        )
+        [flag] = [part for part in command if part.startswith("--secret-env-vars=")]
+        hidden = flag.split("=", 1)[1].split(",")
+        self.assertEqual(
+            sorted(hidden),
+            sorted(
+                [
+                    "OPENAI_API_KEY",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "MY_SERVICE_TOKEN",
+                    "COPILOT_GH_ACCOUNT_GITHUB_2E_COM_USER",
+                    *codex_cli.COPILOT_AUTH_ENV_VARS,
+                ]
+            ),
+        )
+        self.assertLess(command.index(flag), command.index("--excluded-tools"))
+
     def test_web_search_adds_only_the_github_search_tool(self):
         command = self.command(web_search="live")
         self.assertNotIn("--disable-builtin-mcps", command)
