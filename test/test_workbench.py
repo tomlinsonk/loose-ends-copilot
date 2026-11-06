@@ -1742,9 +1742,11 @@ class WorkbenchPlanningTests(unittest.TestCase):
                 manuscripts=manuscripts,
                 catalog_version=1,
             )
+            resources = plan["units"][0]["resources"]
+            self.assertNotIn(f"manuscript:{manuscripts.resolve()}", resources)
             self.assertIn(
-                f"manuscript:{manuscripts.resolve()}",
-                plan["units"][0]["resources"],
+                f"manuscript-paper:{manuscripts.resolve().as_posix()}/{paper.name}",
+                resources,
             )
             argv = plan["units"][0]["argv"]
             self.assertIn("--output-dir", argv)
@@ -2056,6 +2058,46 @@ class WorkbenchStoreTests(unittest.TestCase):
         )
         plan["units"][0]["targets"] = [{"kind": kind, "path": str(path)}]
         return plan
+
+    def _legacy_write_plan(self, manuscripts: Path, *papers: Path) -> dict:
+        resource = f"manuscript:{manuscripts}"
+        plan = fake_plan(
+            [
+                sys.executable,
+                "-u",
+                str(PROJECT_ROOT / "src" / "write_paper.py"),
+                *(str(paper) for paper in papers),
+                "--output-dir",
+                str(manuscripts),
+            ],
+            resources=[resource, *(f"paper:{paper}" for paper in papers)],
+        )
+        plan["units"][0]["targets"] = [
+            {"kind": "paper", "path": str(paper)} for paper in papers
+        ]
+        return plan
+
+    def test_writes_from_different_papers_run_together(self):
+        with TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            manuscripts = state / "manuscripts"
+            first, second, third = (state / "papers" / name for name in "abc")
+            store = WorkbenchStore(state / "workbench.sqlite3", state)
+            # Folder-wide manuscript locks simulate runs queued by older versions.
+            for papers in ((first, second), (third,), (state / "other" / "a",)):
+                store.create_job(
+                    {"action": "write"},
+                    self._legacy_write_plan(manuscripts, *papers),
+                )
+
+            running = store.claim_next_run(set())
+            store.update_run(running["id"], status="running", heartbeat_at=time.time())
+            second_run = store.claim_next_run(store.active_resources())
+            self.assertIsNotNone(second_run)
+            self.assertEqual(second_run["targets"], [{"kind": "paper", "path": str(third)}])
+            store.update_run(second_run["id"], status="running", heartbeat_at=time.time())
+            # A paper with the same directory name could derive the same manuscript.
+            self.assertIsNone(store.claim_next_run(store.active_resources()))
 
     def test_different_problems_in_one_paper_can_run_together(self):
         with TemporaryDirectory() as temporary:

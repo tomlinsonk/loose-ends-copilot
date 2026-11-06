@@ -18,6 +18,7 @@ import analyze_papers
 import codex_cli
 import download_arxiv
 import open_problem_common as common
+from workbench_store import write_manuscript_resources
 
 
 ACTIONS = {
@@ -813,7 +814,9 @@ def build_plan(
                 argv=argv,
                 project_root=project_root,
                 targets=targets,
-                additional_resources=(f"manuscript:{manuscripts.resolve()}",),
+                additional_resources=write_manuscript_resources(
+                    str(manuscripts.resolve()), targets, _text(options, "name")
+                ),
             )
         )
 
