@@ -25,6 +25,8 @@ import threading
 import time
 import tomllib
 from typing import Callable, Mapping
+import urllib.error
+import urllib.request
 import uuid
 
 from validation import common as validation_common
@@ -72,6 +74,27 @@ COPILOT_USAGE_EVENT = "loose_ends.copilot_usage"
 # the invocation from launch so usage accounting can track in-progress turns.
 COPILOT_STARTED_EVENT = "loose_ends.copilot_started"
 COPILOT_USAGE_FILENAME = "usage.json"
+COPILOT_USAGE_SNAPSHOT_FILENAME = "usage.last.json"
+# A dropped connection ends a Copilot session with a transport error; the
+# driver waits for the network and resumes the same session instead.
+COPILOT_NETWORK_ERROR_RE = re.compile(
+    r"network fetch failed|error sending request|dns error|ENOTFOUND|EAI_AGAIN"
+    r"|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH"
+    r"|No such host is known|socket hang up",
+    re.IGNORECASE,
+)
+COPILOT_MAX_NETWORK_RESUMES = 10
+COPILOT_NETWORK_PROBE_URL = "https://api.github.com/"
+COPILOT_NETWORK_POLL_SECONDS = 30.0
+COPILOT_NETWORK_WAIT_SECONDS = 24 * 60 * 60.0
+COPILOT_RESUME_PROMPT = (
+    "The network connection was lost while you were working, and it is back "
+    "now. Continue the same task from where you stopped. Do not redo work "
+    "that is already complete in the working directory. Background shell "
+    "commands started before the interruption are no longer running, so "
+    "rerun any whose results you still need. Satisfy every requirement of "
+    "the original instructions, including the final result."
+)
 DEFAULT_MODEL = "gpt-6-astra"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_VALIDATION_PROMPT_PATH = (
@@ -1515,6 +1538,7 @@ def build_copilot_command(
     usage_path: Path,
     web_search: str = "disabled",
     environment: Mapping[str, str] | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
     if web_search not in WEB_SEARCH_MODES:
         raise CodexError(
@@ -1562,6 +1586,8 @@ def build_copilot_command(
         command.extend(("--model", options.model))
     if options.reasoning_effort is not None:
         command.extend(("--reasoning-effort", options.reasoning_effort))
+    if session_id is not None:
+        command.extend(("--session-id", session_id))
     environment = os.environ if environment is None else environment
     command.append("--secret-env-vars=" + ",".join(copilot_secret_env_vars(environment)))
     # Variadic, so it stays last; the prompt is read from standard input.
@@ -1637,8 +1663,99 @@ def append_copilot_usage_event(
 ) -> None:
     event = copilot_usage_event(usage_path, events_path, invocation_id)
     if event is None:
+        snapshot = usage_path.with_name(COPILOT_USAGE_SNAPSHOT_FILENAME)
+        if snapshot.is_file():
+            event = copilot_usage_event(snapshot, events_path, invocation_id)
+    if event is None:
         return
     _append_event(events_path, event)
+
+
+def snapshot_copilot_usage(usage_path: Path) -> None:
+    """Keep the last usage file with metrics in case a resume overwrites it."""
+    usage = _read_jsonc_object(usage_path)
+    metrics = usage.get("modelMetrics")
+    if isinstance(metrics, dict) and metrics:
+        try:
+            shutil.copyfile(
+                usage_path,
+                usage_path.with_name(COPILOT_USAGE_SNAPSHOT_FILENAME),
+            )
+        except OSError:
+            pass
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_from(path: Path, offset: int) -> str:
+    try:
+        with path.open("rb") as source:
+            source.seek(offset)
+            return source.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def copilot_network_failure(
+    events_path: Path,
+    log_path: Path,
+    *,
+    events_offset: int = 0,
+    log_offset: int = 0,
+) -> str | None:
+    """Return the network error that ended a Copilot process, if any."""
+    for line in _read_from(events_path, events_offset).splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "session.error":
+            continue
+        data = event.get("data")
+        message = data.get("message") if isinstance(data, dict) else None
+        if isinstance(message, str) and COPILOT_NETWORK_ERROR_RE.search(message):
+            return message.strip()
+    for line in _read_from(log_path, log_offset).splitlines():
+        if COPILOT_NETWORK_ERROR_RE.search(line):
+            return line.strip()
+    return None
+
+
+def copilot_session_started(events_path: Path) -> bool:
+    """Return whether Copilot recorded the prompt in its session."""
+    for line in _read_from(events_path, 0).splitlines():
+        if '"user.message"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "user.message":
+            return True
+    return False
+
+
+def wait_for_network(max_seconds: float = COPILOT_NETWORK_WAIT_SECONDS) -> bool:
+    """Poll GitHub until it answers, returning False after max_seconds."""
+    deadline = time.monotonic() + max_seconds
+    while True:
+        request = urllib.request.Request(COPILOT_NETWORK_PROBE_URL, method="HEAD")
+        try:
+            with urllib.request.urlopen(request, timeout=15):
+                return True
+        except urllib.error.HTTPError:
+            return True
+        except (OSError, ValueError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(COPILOT_NETWORK_POLL_SECONDS, remaining))
 
 
 def copilot_final_message(events_path: Path) -> str | None:
@@ -1864,9 +1981,11 @@ def _run_structured_turn(
     environment = codex_subprocess_environment()
     usage_path: Path | None = None
     invocation_id: str | None = None
+    session_id: str | None = None
     if copilot_home is not None:
         usage_path = copilot_home / COPILOT_USAGE_FILENAME
         invocation_id = uuid.uuid4().hex
+        session_id = str(uuid.uuid4())
         _append_event(
             events_path,
             {"type": COPILOT_STARTED_EVENT, "invocation_id": invocation_id},
@@ -1885,6 +2004,7 @@ def _run_structured_turn(
             usage_path=usage_path,
             web_search=web_search,
             environment=environment,
+            session_id=session_id,
         )
         environment[COPILOT_HOME_ENV] = str(copilot_home)
     else:
@@ -1904,79 +2024,132 @@ def _run_structured_turn(
     structured_result_complete = False
     timed_out = False
     credit_error: str | None = None
-    for attempt in range(1, MAX_CODEX_START_ATTEMPTS + 1):
-        wait_for_codex_launch_slot(launch_interval)
-        try:
-            with (
-                events_path.open("a", encoding="utf-8") as events,
-                log_path.open("a", encoding="utf-8") as log,
-            ):
-                if attempt > 1:
-                    log.write(
-                        f"\n--- {agent} startup retry {attempt}/"
-                        f"{MAX_CODEX_START_ATTEMPTS} ---\n"
-                    )
-                    log.flush()
-                if (
-                    timeout_seconds is None
-                    and completion_grace_seconds is None
+    deadline = (
+        None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    )
+    turn_prompt = prompt
+    resumes = 0
+    while True:
+        events_offset = _file_size(events_path)
+        log_offset = _file_size(log_path)
+        remaining_seconds = (
+            None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        )
+        for attempt in range(1, MAX_CODEX_START_ATTEMPTS + 1):
+            wait_for_codex_launch_slot(launch_interval)
+            try:
+                with (
+                    events_path.open("a", encoding="utf-8") as events,
+                    log_path.open("a", encoding="utf-8") as log,
                 ):
-                    completed = subprocess.run(
-                        command,
-                        cwd=workspace,
-                        env=environment,
-                        input=prompt,
-                        stdout=events,
-                        stderr=log,
-                        text=True,
-                        encoding="utf-8",
-                        check=False,
-                    )
-                else:
-                    (
-                        completed,
-                        structured_result_complete,
-                        timed_out,
-                    ) = _run_codex_process(
-                        command,
-                        prompt=prompt,
-                        workspace=workspace,
-                        environment=environment,
-                        events=events,
-                        log=log,
-                        events_path=events_path,
-                        result_path=result_path,
-                        timeout_seconds=timeout_seconds,
-                        completion_grace_seconds=completion_grace_seconds,
-                    )
-        except OSError as exc:
-            if (
-                attempt < MAX_CODEX_START_ATTEMPTS
-                and getattr(exc, "winerror", None) in {2, 3}
-            ):
-                with log_path.open("a", encoding="utf-8") as log:
-                    log.write(f"{agent} startup error: {exc}\n")
-                continue
-            raise CodexError(
-                f"could not start {agent}; workspace preserved at "
-                f"{workspace}: {exc}"
-            ) from exc
+                    if attempt > 1:
+                        log.write(
+                            f"\n--- {agent} startup retry {attempt}/"
+                            f"{MAX_CODEX_START_ATTEMPTS} ---\n"
+                        )
+                        log.flush()
+                    if (
+                        timeout_seconds is None
+                        and completion_grace_seconds is None
+                    ):
+                        completed = subprocess.run(
+                            command,
+                            cwd=workspace,
+                            env=environment,
+                            input=turn_prompt,
+                            stdout=events,
+                            stderr=log,
+                            text=True,
+                            encoding="utf-8",
+                            check=False,
+                        )
+                    else:
+                        (
+                            completed,
+                            structured_result_complete,
+                            timed_out,
+                        ) = _run_codex_process(
+                            command,
+                            prompt=turn_prompt,
+                            workspace=workspace,
+                            environment=environment,
+                            events=events,
+                            log=log,
+                            events_path=events_path,
+                            result_path=result_path,
+                            timeout_seconds=remaining_seconds,
+                            completion_grace_seconds=completion_grace_seconds,
+                        )
+            except OSError as exc:
+                if (
+                    attempt < MAX_CODEX_START_ATTEMPTS
+                    and getattr(exc, "winerror", None) in {2, 3}
+                ):
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(f"{agent} startup error: {exc}\n")
+                    continue
+                raise CodexError(
+                    f"could not start {agent}; workspace preserved at "
+                    f"{workspace}: {exc}"
+                ) from exc
 
-        credit_error = agent_credit_error(events_path, log_path)
-        if credit_error is not None:
-            pause_queue_for_credit_error(credit_error)
-            break
-        if completed.returncode == 0 or structured_result_complete or timed_out:
-            break
+            credit_error = agent_credit_error(events_path, log_path)
+            if credit_error is not None:
+                pause_queue_for_credit_error(credit_error)
+                break
+            if completed.returncode == 0 or structured_result_complete or timed_out:
+                break
+            if (
+                attempt == MAX_CODEX_START_ATTEMPTS
+                or not is_transient_startup_failure(
+                    completed,
+                    events_path,
+                    log_path,
+                )
+            ):
+                break
+
+        if usage_path is not None:
+            snapshot_copilot_usage(usage_path)
         if (
-            attempt == MAX_CODEX_START_ATTEMPTS
-            or not is_transient_startup_failure(
-                completed,
-                events_path,
-                log_path,
-            )
+            session_id is None
+            or completed is None
+            or completed.returncode == 0
+            or structured_result_complete
+            or timed_out
+            or credit_error is not None
+            or resumes >= COPILOT_MAX_NETWORK_RESUMES
         ):
             break
+        failure = copilot_network_failure(
+            events_path,
+            log_path,
+            events_offset=events_offset,
+            log_offset=log_offset,
+        )
+        if failure is None:
+            break
+        resumes += 1
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(
+                f"\nDriver: {agent} lost its network connection ({failure}); "
+                f"waiting for the network to resume the session "
+                f"({resumes}/{COPILOT_MAX_NETWORK_RESUMES}).\n"
+            )
+        wait_seconds = COPILOT_NETWORK_WAIT_SECONDS
+        if deadline is not None:
+            wait_seconds = min(wait_seconds, deadline - time.monotonic())
+        if wait_seconds <= 0 or not wait_for_network(wait_seconds):
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write("Driver: the network did not return; giving up.\n")
+            break
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(
+                f"\n--- {agent} network resume {resumes}/"
+                f"{COPILOT_MAX_NETWORK_RESUMES} ---\n"
+            )
+        if copilot_session_started(events_path):
+            turn_prompt = COPILOT_RESUME_PROMPT
 
     note_windows_sandbox_failure(log_path)
     if usage_path is not None:

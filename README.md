@@ -117,6 +117,12 @@ With the Copilot backend, each agent turn runs as follows:
 * Token counts, the model, and Copilot's request/AI-credit usage are added to
   `events.jsonl`. The workbench usage view counts them like Codex turns.
   Cost estimates are API-equivalent, and only for models with known rates.
+* If Copilot exits because the network dropped (for example, when a laptop
+  sleeps or goes offline), the driver waits for `api.github.com` to answer
+  again and resumes the same Copilot session with a continue prompt, so the
+  agent keeps its conversation and work. This happens up to 10 times per turn,
+  waiting up to 24 hours each time, within any wall-clock timeout. The log
+  records each `network resume`.
 
 Some options are Codex-only. Copilot rejects `--fast`, `--ultrafast`, and
 reasoning effort `ultra`. It also ignores `CODEX_HOME`.
@@ -981,6 +987,15 @@ selection, destination, and upstream warnings without starting Codex. The
 legacy `--allow-not-ready` option is accepted as a no-op; this is now the
 default behavior. Warnings do not guarantee that the critic will accept the
 result or that the workflow will reach human review.
+
+A failed writer run leaves its workspace as `.write-run-*` in the manuscript
+directory. The next author round with the same inputs continues it: if the
+newest preserved workspace has identical staged inputs, the writer is started
+there and told to reuse its finished `main.tex`, `code/`, and other files.
+Earlier logs are kept ahead of the new ones in the draft's `events.jsonl` and
+`run.log`. Retrying a failed write in the workbench therefore continues it as
+well. `--dry-run` reports a run it would continue, and `--fresh` starts a new
+workspace instead.
 
 The writer receives every originating PDF and source tree, analysis, selected
 attempt and artifacts, solution critique, and literature report. It writes a

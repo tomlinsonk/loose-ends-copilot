@@ -4,12 +4,15 @@ import os
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import tomllib
 import unittest
 from unittest.mock import Mock, patch
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -966,6 +969,225 @@ class CopilotBackendTests(unittest.TestCase):
         self.assertEqual(last["invocation_id"], first["invocation_id"])
         self.assertEqual(last["session_id"], "abc")
         self.assertEqual(last["usage"]["input_tokens"], 3)
+
+    def test_command_pins_session_id_before_variadic_exclusions(self):
+        command = codex_cli.build_copilot_command(
+            copilot="copilot",
+            workspace=self.root,
+            options=codex_cli.ModelOptions(),
+            usage_path=self.root / "usage.json",
+            session_id="1234",
+        )
+        self.assertEqual(command[command.index("--session-id") + 1], "1234")
+        self.assertLess(command.index("--session-id"), command.index("--excluded-tools"))
+        self.assertNotIn("--session-id", self.command())
+
+    def test_detects_network_failures_only_in_new_output(self):
+        events = self.root / "events.jsonl"
+        log = self.root / "run.log"
+        old = json.dumps({
+            "type": "session.error",
+            "data": {"message": "dns error: No such host is known [ENOTFOUND]"},
+        }) + "\n"
+        events.write_text(old, encoding="utf-8")
+        log.write_text("", encoding="utf-8")
+        self.assertIn("ENOTFOUND", codex_cli.copilot_network_failure(events, log))
+        self.assertIsNone(
+            codex_cli.copilot_network_failure(
+                events, log, events_offset=len(old.encode())
+            )
+        )
+        with events.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "type": "session.error",
+                "data": {"message": "The model refused the request."},
+            }) + "\n")
+            stream.write(json.dumps({
+                "type": "tool.execution_complete",
+                "data": {"result": "fetch failed: ECONNRESET"},
+            }) + "\n")
+        self.assertIsNone(
+            codex_cli.copilot_network_failure(
+                events, log, events_offset=len(old.encode())
+            )
+        )
+        log.write_text(
+            "Authentication token found but could not be validated: "
+            "network fetch failed\n",
+            encoding="utf-8",
+        )
+        self.assertIn(
+            "network fetch failed",
+            codex_cli.copilot_network_failure(
+                events, log, events_offset=events.stat().st_size
+            ),
+        )
+
+    def run_with_processes(self, *processes, network=True):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        schema = workspace / "schema.json"
+        schema.write_text("{}", encoding="utf-8")
+        calls = []
+
+        def fake_run(command, *, prompt, events, log, **_):
+            calls.append((command, prompt))
+            usage = Path(command[command.index("--usage-output-file") + 1])
+            return processes[len(calls) - 1](usage, events, log)
+
+        with (
+            patch.object(codex_cli, "_run_codex_process", side_effect=fake_run),
+            patch.object(codex_cli, "wait_for_codex_launch_slot"),
+            patch.object(codex_cli, "wait_for_network", return_value=network) as wait,
+        ):
+            try:
+                codex_cli.run_structured_codex(
+                    codex="copilot",
+                    workspace=workspace,
+                    prompt="Solve it.",
+                    schema_path=schema,
+                    timeout_seconds=60,
+                )
+                error = None
+            except codex_cli.CodexError as exc:
+                error = exc
+        return workspace, calls, wait, error
+
+    @staticmethod
+    def write_events(events, *items):
+        for item in items:
+            events.write(json.dumps(item) + "\n")
+        events.flush()
+
+    @staticmethod
+    def write_usage(usage, input_tokens):
+        usage.write_text(json.dumps({
+            "currentModel": "gpt-5.5",
+            "modelMetrics": {"gpt-5.5": {"usage": {"inputTokens": input_tokens}}},
+        }), encoding="utf-8")
+
+    def test_network_loss_resumes_the_same_session(self):
+        def dropped(usage, events, log):
+            self.write_usage(usage, 5)
+            self.write_events(
+                events,
+                {"type": "user.message", "data": {"content": "Solve it."}},
+                {"type": "session.error", "data": {
+                    "message": "error sending request for url: dns error [ENOTFOUND]",
+                }},
+                {"type": "result", "sessionId": "s", "exitCode": 1},
+            )
+            return subprocess.CompletedProcess([], 1), False, False
+
+        def resumed(usage, events, log):
+            self.write_usage(usage, 8)
+            self.write_events(
+                events,
+                {"type": "assistant.message", "data": {"content": '{"ok": true}'}},
+                {"type": "result", "sessionId": "s", "exitCode": 0},
+            )
+            return subprocess.CompletedProcess([], 0), True, False
+
+        workspace, calls, wait, error = self.run_with_processes(dropped, resumed)
+        self.assertIsNone(error)
+        self.assertEqual(len(calls), 2)
+        wait.assert_called_once()
+        first, second = (command for command, _ in calls)
+        self.assertEqual(first, second)
+        self.assertIn("--session-id", first)
+        self.assertIn("agent-result.json", calls[0][1])
+        self.assertEqual(calls[1][1], codex_cli.COPILOT_RESUME_PROMPT)
+        self.assertEqual(
+            json.loads((workspace / "agent-result.json").read_text(encoding="utf-8")),
+            {"ok": True},
+        )
+        events = [
+            json.loads(line)
+            for line in (workspace / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        types = [event["type"] for event in events]
+        self.assertEqual(types.count(codex_cli.COPILOT_STARTED_EVENT), 1)
+        self.assertEqual(types.count(codex_cli.COPILOT_USAGE_EVENT), 1)
+        self.assertEqual(events[-1]["usage"]["input_tokens"], 8)
+        log = (workspace / "run.log").read_text(encoding="utf-8")
+        self.assertIn("network resume 1/", log)
+
+    def test_offline_startup_reruns_the_original_prompt(self):
+        def offline(usage, events, log):
+            log.write(
+                "Error: Authentication token found but could not be validated "
+                "(network fetch failed)\n"
+            )
+            log.flush()
+            return subprocess.CompletedProcess([], 1), False, False
+
+        def online(usage, events, log):
+            self.write_events(
+                events,
+                {"type": "user.message", "data": {"content": "Solve it."}},
+                {"type": "assistant.message", "data": {"content": '{"ok": true}'}},
+                {"type": "result", "sessionId": "s", "exitCode": 0},
+            )
+            return subprocess.CompletedProcess([], 0), True, False
+
+        _, calls, _, error = self.run_with_processes(offline, online)
+        self.assertIsNone(error)
+        self.assertEqual(calls[0][1], calls[1][1])
+
+    def test_other_failures_and_lasting_outages_do_not_resume(self):
+        def refused(usage, events, log):
+            self.write_events(
+                events,
+                {"type": "user.message", "data": {"content": "Solve it."}},
+                {"type": "session.error", "data": {"message": "Model refused."}},
+            )
+            return subprocess.CompletedProcess([], 1), False, False
+
+        _, calls, wait, error = self.run_with_processes(refused)
+        self.assertIn("exited with status 1", str(error))
+        self.assertEqual(len(calls), 1)
+        wait.assert_not_called()
+
+        def dropped(usage, events, log):
+            self.write_events(events, {"type": "session.error", "data": {
+                "message": "socket hang up",
+            }})
+            return subprocess.CompletedProcess([], 1), False, False
+
+        shutil.rmtree(self.root / "workspace")
+        workspace, calls, wait, error = self.run_with_processes(dropped, network=False)
+        self.assertIn("exited with status 1", str(error))
+        self.assertEqual(len(calls), 1)
+        wait.assert_called_once()
+        self.assertIn(
+            "network did not return",
+            (workspace / "run.log").read_text(encoding="utf-8"),
+        )
+
+    def test_usage_falls_back_to_last_snapshot_with_metrics(self):
+        usage = self.root / "usage.json"
+        events = self.root / "events.jsonl"
+        events.write_text("", encoding="utf-8")
+        self.write_usage(usage, 7)
+        codex_cli.snapshot_copilot_usage(usage)
+        usage.write_text("{}", encoding="utf-8")
+        codex_cli.snapshot_copilot_usage(usage)
+        codex_cli.append_copilot_usage_event(usage, events, "inv")
+        event = json.loads(events.read_text(encoding="utf-8"))
+        self.assertEqual(event["usage"]["input_tokens"], 7)
+
+    def test_wait_for_network_treats_http_errors_as_reachable(self):
+        error = urllib.error.HTTPError(
+            codex_cli.COPILOT_NETWORK_PROBE_URL, 403, "Forbidden", {}, None
+        )
+        with patch.object(urllib.request, "urlopen", side_effect=error):
+            self.assertTrue(codex_cli.wait_for_network(0))
+        with (
+            patch.object(urllib.request, "urlopen", side_effect=OSError("offline")),
+            patch.object(codex_cli.time, "sleep") as sleep,
+        ):
+            self.assertFalse(codex_cli.wait_for_network(0))
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

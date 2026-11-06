@@ -1227,6 +1227,111 @@ class WritePaperTests(unittest.TestCase):
                 )
             )
 
+    def run_continuable_round(self, manuscript, inputs, seen, continue_interrupted=True):
+        def fake_codex(**kwargs):
+            workspace = kwargs["workspace"]
+            seen["workspace"] = workspace
+            seen["prompt"] = kwargs["prompt"]
+            seen["main_before"] = (
+                (workspace / "main.tex").read_text(encoding="utf-8")
+                if (workspace / "main.tex").is_file()
+                else None
+            )
+            write_manuscript_files(workspace, ["R-001"])
+            common.write_json(workspace / "agent-result.json", paper_result(["R-001"]))
+            (workspace / "events.jsonl").write_text(
+                '{"type":"turn.completed"}\n', encoding="utf-8"
+            )
+            (workspace / "run.log").write_text("new log\n", encoding="utf-8")
+            return workspace / "agent-result.json"
+
+        def fake_compile(workspace, latexmk):
+            (workspace / "build.log").write_text("ok\n", encoding="utf-8")
+            (workspace / "main.pdf").write_bytes(b"%PDF-paper")
+            return workspace / "main.pdf"
+
+        with (
+            patch.object(codex_cli, "run_structured_codex", side_effect=fake_codex),
+            patch.object(write_paper, "compile_latex", side_effect=fake_compile),
+            redirect_stdout(StringIO()),
+        ):
+            return write_paper.run_author_round(
+                manuscript,
+                inputs,
+                selectors=[],
+                previous=None,
+                authors=["Test Author"],
+                title_hint=None,
+                revision_instruction=None,
+                codex="codex",
+                codex_version="test",
+                latexmk="latexmk",
+                prompt_template=write_paper.DEFAULT_PROMPT_PATH.read_text(
+                    encoding="utf-8"
+                ),
+                schema_path=write_paper.DEFAULT_SCHEMA_PATH,
+                config_digest="writer-config",
+                options=codex_cli.ModelOptions("test-model", "high", False),
+                continue_interrupted=continue_interrupted,
+            )
+
+    def make_interrupted_run(self, manuscript, inputs):
+        workspace = manuscript / ".write-run-interrupted"
+        workspace.mkdir(parents=True)
+        write_paper.stage_paper_context(workspace, inputs)
+        (workspace / "main.tex").write_text("partial draft\n", encoding="utf-8")
+        (workspace / "events.jsonl").write_text(
+            '{"type":"session.error"}\n', encoding="utf-8"
+        )
+        (workspace / "run.log").write_text("old log\n", encoding="utf-8")
+        return workspace.resolve()
+
+    def test_author_round_continues_interrupted_run_with_same_inputs(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            attempt = make_ready_attempt(make_paper(root), "OP-001")
+            inputs = write_paper.load_paper_inputs([attempt])
+            manuscript = root / "manuscripts" / "test"
+            interrupted = self.make_interrupted_run(manuscript, inputs)
+            seen = {}
+            draft = self.run_continuable_round(manuscript, inputs, seen)
+
+            self.assertEqual(seen["workspace"], interrupted)
+            self.assertEqual(seen["main_before"], "partial draft\n")
+            self.assertIn("Continuing an interrupted run", seen["prompt"])
+            self.assertFalse(interrupted.exists())
+            self.assertEqual(
+                (draft.directory / "events.jsonl").read_text(encoding="utf-8"),
+                '{"type":"session.error"}\n{"type":"turn.completed"}\n',
+            )
+            log = (draft.directory / "run.log").read_text(encoding="utf-8")
+            self.assertLess(log.index("old log"), log.index("new log"))
+
+    def test_author_round_starts_fresh_when_inputs_changed_or_requested(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            attempt = make_ready_attempt(make_paper(root), "OP-001")
+            inputs = write_paper.load_paper_inputs([attempt])
+            manuscript = root / "manuscripts" / "test"
+            interrupted = self.make_interrupted_run(manuscript, inputs)
+            self.assertEqual(
+                write_paper.find_interrupted_run(manuscript, inputs, previous=None),
+                interrupted,
+            )
+            seen = {}
+            self.run_continuable_round(
+                manuscript, inputs, seen, continue_interrupted=False
+            )
+            self.assertNotEqual(seen["workspace"], interrupted)
+            self.assertNotIn("Continuing an interrupted run", seen["prompt"])
+            self.assertTrue(interrupted.exists())
+
+            index = interrupted / "inputs" / "index.json"
+            index.write_text(index.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            self.assertIsNone(
+                write_paper.find_interrupted_run(manuscript, inputs, previous=None)
+            )
+
     def test_max_rounds_is_a_hard_cap(self):
         draft = write_paper.DraftRef(
             Path("draft-001"),

@@ -221,7 +221,7 @@ class UsageIndex:
 
     def _installed_context(self, events):
         prefix = events.name.removesuffix("events.jsonl")
-        if prefix == "repair-":
+        if prefix in {"repair-", "interrupted-"}:
             prefix = ""
         manifest = self._json(events.parent / f"{prefix}manifest.json")
         if prefix == "review-" and events.parent.name.startswith("draft-"):
