@@ -1826,7 +1826,9 @@ class WorkbenchPlanningTests(unittest.TestCase):
                     plan = fake_plan([sys.executable, "tool.py"])
                     plan["action"] = action
                     plan["warnings"] = ["Existing warning"]
-                    plan["options"] = {"codexHome": selected} if selected else {}
+                    plan["options"] = {"backend": "codex"}
+                    if selected:
+                        plan["options"]["codexHome"] = selected
                     with (
                         patch.dict(os.environ, {"CODEX_HOME": inherited, "USERPROFILE": ""}),
                         patch("codex_cli.Path.home", return_value=home),
@@ -1846,7 +1848,7 @@ class WorkbenchPlanningTests(unittest.TestCase):
             paper = make_paper(root)
             plan = build_plan(
                 {"action": "metadata", "targets": [{"kind": "paper", "path": str(paper)}],
-                 "options": {"codexHome": str(root / "missing account")}},
+                 "options": {"backend": "codex", "codexHome": str(root / "missing account")}},
                 project_root=PROJECT_ROOT, allowed_roots=[root],
                 manuscripts=root / "manuscripts", catalog_version=1,
             )
@@ -1909,8 +1911,10 @@ class WorkbenchEditTests(unittest.TestCase):
         store.mark_starting(first["id"])
         store.update_run(second["id"], status="succeeded")
         before = store.get_job(job["id"])
-        options = {"codexHome": str(self.root / "new account"), "model": "new-model",
-                   "reasoningEffort": "high", "prompt": "New direction", "fast": True}
+        # The fast service tier exists only on the Codex backend.
+        options = {"backend": "codex", "codexHome": str(self.root / "new account"),
+                   "model": "new-model", "reasoningEffort": "high",
+                   "prompt": "New direction", "fast": True}
         plan = self.preview_edit(before, options)
         self.assertEqual(len(plan["units"]), 1)
         self.assertEqual(plan["units"][0]["runId"], third["id"])
