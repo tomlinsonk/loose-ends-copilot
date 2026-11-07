@@ -278,13 +278,16 @@ test("Copilot transcript events become messages, tool calls, and usage", () => {
   assert.equal(JSON.parse(items[3].text).input_tokens, 5);
 });
 
-test("shared transcript loader preserves report queries and pages both sources", async () => {
+test("shared transcript loader preserves report queries and loads all pages at once", async () => {
   for (const source of ["/api/runs/run-id/codex", "/api/review-codex?key=attempt&version=2"]) {
     const requests = [];
     const pages = [
       { text: "first\n", nextOffset: 6, complete: false },
-      { text: "second\n", nextOffset: 13, complete: true },
+      { text: "second\n", nextOffset: 13, complete: false },
+      { text: "", nextOffset: 13, complete: false },
+      { text: "third\n", nextOffset: 19, complete: true },
     ];
+    const offsets = ["0", "6", "13", "13"];
     const context = vm.createContext({
       URLSearchParams,
       state: { codexLogs: new Map(), codexLoads: new Set(), codexTimers: new Map() },
@@ -296,15 +299,19 @@ test("shared transcript loader preserves report queries and pages both sources",
         const query = new URL(url, "http://localhost").searchParams;
         if (source.includes("?")) assert.equal(query.get("key"), "attempt");
         if (query.get("kind") === "diagnostics") return { text: "", nextOffset: 0, complete: true };
-        assert.equal(query.get("offset"), pages.length === 2 ? "0" : "6");
+        assert.equal(query.get("offset"), offsets.shift());
         return pages.shift();
       },
     });
     vm.runInContext(functions, context);
     const element = { dataset: { rendered: "true" }, isConnected: true };
-    await context.refreshCodexLogs(source, element);
+    // One refresh reads every page already written, stopping once caught up.
     await context.refreshCodexLogs(source, element);
     assert.equal(context.state.codexLogs.get(source)[0].events, "first\nsecond\n");
+    assert.equal(pages.length, 1);
+    await context.refreshCodexLogs(source, element);
+    await context.refreshCodexLogs(source, element);
+    assert.equal(context.state.codexLogs.get(source)[0].events, "first\nsecond\nthird\n");
     assert.equal(pages.length, 0);
     assert.equal(requests.filter(url => url.includes("kind=prompt")).length, 0);
   }

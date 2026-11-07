@@ -4007,12 +4007,18 @@ async function refreshCodexLogs(source, element) {
       for (const kind of ["prompt", "events", "diagnostics"]) {
         // Older transcripts have no saved prompt.
         if (kind === "prompt" && entry.legacy) continue;
-        const previous = transcript.files[kind] || {};
-        if (previous.complete) continue;
-        const result = await api(`${source}${source.includes("?") ? "&" : "?"}${new URLSearchParams({ id: entry.id, kind, offset: previous.nextOffset || 0 })}`);
-        transcript.files[kind] = result;
-        transcript[kind] = (transcript[kind] || "") + result.text;
-        if (result.text) changed = true;
+        let previous = transcript.files[kind] || {};
+        // Fetch every available page now; waiting between pages made long
+        // transcripts grow for minutes and re-render after each page.
+        while (!previous.complete) {
+          const offset = previous.nextOffset || 0;
+          const result = await api(`${source}${source.includes("?") ? "&" : "?"}${new URLSearchParams({ id: entry.id, kind, offset })}`);
+          transcript.files[kind] = result;
+          transcript[kind] = (transcript[kind] || "") + result.text;
+          if (!result.text || !(result.nextOffset > offset)) break;
+          changed = true;
+          previous = result;
+        }
       }
     }
     state.codexLogs.set(source, cached);
@@ -4022,9 +4028,11 @@ async function refreshCodexLogs(source, element) {
       if (current.dataset.codexSource !== source || (!changed && current === element)) return;
       const expanded = [...current.querySelectorAll("details")].map(value => value.open);
       const scrollTop = current.scrollTop;
+      const followBottom = scrollTop > 0 &&
+        current.scrollHeight - scrollTop - current.clientHeight <= 24;
       renderCodexTranscript(current, cached);
       current.querySelectorAll("details").forEach((value, index) => { value.open = expanded[index] || false; });
-      current.scrollTop = scrollTop;
+      current.scrollTop = followBottom ? current.scrollHeight : scrollTop;
     });
   } catch (error) {
     if (element.isConnected && !cached.length) element.replaceChildren(node("p", "error-box", error.message));
