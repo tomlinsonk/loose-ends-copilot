@@ -1742,9 +1742,11 @@ class WorkbenchPlanningTests(unittest.TestCase):
                 manuscripts=manuscripts,
                 catalog_version=1,
             )
+            resources = plan["units"][0]["resources"]
+            self.assertNotIn(f"manuscript:{manuscripts.resolve()}", resources)
             self.assertIn(
-                f"manuscript:{manuscripts.resolve()}",
-                plan["units"][0]["resources"],
+                f"manuscript-paper:{manuscripts.resolve().as_posix()}/{paper.name}",
+                resources,
             )
             argv = plan["units"][0]["argv"]
             self.assertIn("--output-dir", argv)
@@ -1824,7 +1826,9 @@ class WorkbenchPlanningTests(unittest.TestCase):
                     plan = fake_plan([sys.executable, "tool.py"])
                     plan["action"] = action
                     plan["warnings"] = ["Existing warning"]
-                    plan["options"] = {"codexHome": selected} if selected else {}
+                    plan["options"] = {"backend": "codex"}
+                    if selected:
+                        plan["options"]["codexHome"] = selected
                     with (
                         patch.dict(os.environ, {"CODEX_HOME": inherited, "USERPROFILE": ""}),
                         patch("codex_cli.Path.home", return_value=home),
@@ -1844,7 +1848,7 @@ class WorkbenchPlanningTests(unittest.TestCase):
             paper = make_paper(root)
             plan = build_plan(
                 {"action": "metadata", "targets": [{"kind": "paper", "path": str(paper)}],
-                 "options": {"codexHome": str(root / "missing account")}},
+                 "options": {"backend": "codex", "codexHome": str(root / "missing account")}},
                 project_root=PROJECT_ROOT, allowed_roots=[root],
                 manuscripts=root / "manuscripts", catalog_version=1,
             )
@@ -1907,8 +1911,10 @@ class WorkbenchEditTests(unittest.TestCase):
         store.mark_starting(first["id"])
         store.update_run(second["id"], status="succeeded")
         before = store.get_job(job["id"])
-        options = {"codexHome": str(self.root / "new account"), "model": "new-model",
-                   "reasoningEffort": "high", "prompt": "New direction", "fast": True}
+        # The fast service tier exists only on the Codex backend.
+        options = {"backend": "codex", "codexHome": str(self.root / "new account"),
+                   "model": "new-model", "reasoningEffort": "high",
+                   "prompt": "New direction", "fast": True}
         plan = self.preview_edit(before, options)
         self.assertEqual(len(plan["units"]), 1)
         self.assertEqual(plan["units"][0]["runId"], third["id"])
@@ -2056,6 +2062,46 @@ class WorkbenchStoreTests(unittest.TestCase):
         )
         plan["units"][0]["targets"] = [{"kind": kind, "path": str(path)}]
         return plan
+
+    def _legacy_write_plan(self, manuscripts: Path, *papers: Path) -> dict:
+        resource = f"manuscript:{manuscripts}"
+        plan = fake_plan(
+            [
+                sys.executable,
+                "-u",
+                str(PROJECT_ROOT / "src" / "write_paper.py"),
+                *(str(paper) for paper in papers),
+                "--output-dir",
+                str(manuscripts),
+            ],
+            resources=[resource, *(f"paper:{paper}" for paper in papers)],
+        )
+        plan["units"][0]["targets"] = [
+            {"kind": "paper", "path": str(paper)} for paper in papers
+        ]
+        return plan
+
+    def test_writes_from_different_papers_run_together(self):
+        with TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            manuscripts = state / "manuscripts"
+            first, second, third = (state / "papers" / name for name in "abc")
+            store = WorkbenchStore(state / "workbench.sqlite3", state)
+            # Folder-wide manuscript locks simulate runs queued by older versions.
+            for papers in ((first, second), (third,), (state / "other" / "a",)):
+                store.create_job(
+                    {"action": "write"},
+                    self._legacy_write_plan(manuscripts, *papers),
+                )
+
+            running = store.claim_next_run(set())
+            store.update_run(running["id"], status="running", heartbeat_at=time.time())
+            second_run = store.claim_next_run(store.active_resources())
+            self.assertIsNotNone(second_run)
+            self.assertEqual(second_run["targets"], [{"kind": "paper", "path": str(third)}])
+            store.update_run(second_run["id"], status="running", heartbeat_at=time.time())
+            # A paper with the same directory name could derive the same manuscript.
+            self.assertIsNone(store.claim_next_run(store.active_resources()))
 
     def test_different_problems_in_one_paper_can_run_together(self):
         with TemporaryDirectory() as temporary:

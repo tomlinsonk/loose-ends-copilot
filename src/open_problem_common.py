@@ -346,6 +346,11 @@ def repair_problem_data_access(
                 inaccessible.append(directory)
     if not inaccessible:
         return None, 0
+    if codex_cli.using_copilot():
+        # The repair locates the Codex CLI itself; the run uses Copilot.
+        for directory in inaccessible:
+            codex_cli.normalize_workspace_access(directory, codex_command)
+        return None, len(inaccessible)
     codex = codex_cli.resolve_codex_executable(codex_command)
     for directory in inaccessible:
         codex_cli.normalize_workspace_access(directory, codex)

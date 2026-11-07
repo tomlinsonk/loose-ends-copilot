@@ -5,7 +5,7 @@ const vm = require("node:vm");
 
 const source = readFileSync(`${__dirname}/../src/workbench_web/app.js`, "utf8");
 const functions = [
-  "latestJobRuns", "retryJob", "codexItems", "refreshCodexLogs",
+  "latestJobRuns", "retryJob", "copilotItem", "codexItems", "refreshCodexLogs",
   "separateWriteTasks", "taskRequests", "taskRequestOptions", "taskTargetsForRequest",
   "targetKey", "targetCountLabel", "reviewTask", "confirmTask", "collectDialogOptions",
   "saveProblemEditor", "configuredMemoryLimit", "renderMemoryControl",
@@ -252,13 +252,42 @@ test("Codex transcript updates items and keeps repeated IDs in later turns", () 
   assert.equal(items[2].text, "failure");
 });
 
-test("shared transcript loader preserves report queries and pages both sources", async () => {
+test("Copilot transcript events become messages, tool calls, and usage", () => {
+  const context = vm.createContext({});
+  vm.runInContext(functions, context);
+  const events = [
+    { type: "loose_ends.copilot_started", invocation_id: "c1" },
+    { type: "session.start", data: {} },
+    { type: "assistant.message", data: { messageId: "m0", content: "", toolRequests: [] } },
+    { type: "tool.execution_start", data: { toolCallId: "t1", toolName: "powershell", arguments: { command: "ls" } } },
+    { type: "tool.shell_output", data: { toolCallId: "t1", text: "partial" } },
+    { type: "tool.execution_complete", data: { toolCallId: "t1", success: true, result: { content: "listing" } } },
+    { type: "tool.execution_start", data: { toolCallId: "t2", toolName: "view", arguments: { path: "a.txt" } } },
+    { type: "assistant.message", data: { messageId: "m1", content: "Done" } },
+    { type: "result", sessionId: "s", exitCode: 0 },
+    { type: "loose_ends.copilot_usage", usage: { input_tokens: 5 } },
+  ].map(value => JSON.stringify(value)).join("\n");
+  const items = context.codexItems(events);
+  assert.equal(items.map(item => item.type).join(","), "powershell,view,agent_message,usage");
+  assert.equal(items[0].command, "ls");
+  assert.equal(items[0].status, "completed");
+  assert.equal(items[0].aggregated_output, "listing");
+  assert.equal(items[1].command, "a.txt");
+  assert.equal(items[1].status, "in_progress");
+  assert.equal(items[2].text, "Done");
+  assert.equal(JSON.parse(items[3].text).input_tokens, 5);
+});
+
+test("shared transcript loader preserves report queries and loads all pages at once", async () => {
   for (const source of ["/api/runs/run-id/codex", "/api/review-codex?key=attempt&version=2"]) {
     const requests = [];
     const pages = [
       { text: "first\n", nextOffset: 6, complete: false },
-      { text: "second\n", nextOffset: 13, complete: true },
+      { text: "second\n", nextOffset: 13, complete: false },
+      { text: "", nextOffset: 13, complete: false },
+      { text: "third\n", nextOffset: 19, complete: true },
     ];
+    const offsets = ["0", "6", "13", "13"];
     const context = vm.createContext({
       URLSearchParams,
       state: { codexLogs: new Map(), codexLoads: new Set(), codexTimers: new Map() },
@@ -270,15 +299,19 @@ test("shared transcript loader preserves report queries and pages both sources",
         const query = new URL(url, "http://localhost").searchParams;
         if (source.includes("?")) assert.equal(query.get("key"), "attempt");
         if (query.get("kind") === "diagnostics") return { text: "", nextOffset: 0, complete: true };
-        assert.equal(query.get("offset"), pages.length === 2 ? "0" : "6");
+        assert.equal(query.get("offset"), offsets.shift());
         return pages.shift();
       },
     });
     vm.runInContext(functions, context);
     const element = { dataset: { rendered: "true" }, isConnected: true };
-    await context.refreshCodexLogs(source, element);
+    // One refresh reads every page already written, stopping once caught up.
     await context.refreshCodexLogs(source, element);
     assert.equal(context.state.codexLogs.get(source)[0].events, "first\nsecond\n");
+    assert.equal(pages.length, 1);
+    await context.refreshCodexLogs(source, element);
+    await context.refreshCodexLogs(source, element);
+    assert.equal(context.state.codexLogs.get(source)[0].events, "first\nsecond\nthird\n");
     assert.equal(pages.length, 0);
     assert.equal(requests.filter(url => url.includes("kind=prompt")).length, 0);
   }

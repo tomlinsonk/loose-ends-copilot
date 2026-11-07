@@ -821,6 +821,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="Codex CLI executable or command name (default: codex)",
     )
+    codex_cli.add_backend_arguments(parser)
     codex_cli.add_prompt_arguments(
         parser,
         default_template=DEFAULT_PROMPT_PATH,
@@ -842,6 +843,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        codex_cli.configure_backend(args)
         input_paths, direct_exact = common.direct_problem_inputs(args.paths)
         if direct_exact and (
             args.from_triage is not None
@@ -959,7 +961,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if stale:
         try:
-            codex = codex_cli.resolve_codex_executable(args.codex)
+            codex = codex_cli.agent_executable(args)
             codex_version = codex_cli.read_codex_version(codex)
         except common.CodexError as exc:
             return codex_cli.report_error(parser, exc)
@@ -974,7 +976,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Searching literature for {len(stale)} stale problem(s) from "
             f"{len(grouped)} paper(s), with up to "
-            f"{min(args.jobs, len(grouped))} Codex agent(s) at once "
+            f"{min(args.jobs, len(grouped))} {codex_cli.backend_name()} "
+            "agent(s) at once "
             f"({args.web_search} web search)."
         )
         with ThreadPoolExecutor(

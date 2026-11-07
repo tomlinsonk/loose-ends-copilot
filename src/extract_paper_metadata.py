@@ -172,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="replace populated metadata")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--codex", default="codex")
+    codex_cli.add_backend_arguments(parser)
     codex_cli.add_prompt_arguments(
         parser,
         default_template=DEFAULT_PROMPT_PATH,
@@ -191,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paper = args.paper.expanduser().resolve()
     try:
+        codex_cli.configure_backend(args)
         metadata = load_metadata(paper / "metadata.json")
         if not paper.is_dir() or not (paper / "paper.pdf").is_file():
             raise MetadataExtractionError(
@@ -201,7 +203,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.dry_run:
             codex_cli.report_codex_home_warnings()
-            print("Would ask Codex to extract title and authors from:")
+            print(
+                f"Would ask {codex_cli.backend_name()} to extract title and "
+                "authors from:"
+            )
             print(f"  PDF: {paper / 'paper.pdf'}")
             source = paper / "source"
             print(f"  Source: {source if source.exists() else 'none'}")
@@ -216,13 +221,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         extract_metadata(
             paper,
-            codex=codex_cli.resolve_codex_executable(args.codex),
+            codex=codex_cli.agent_executable(args),
             prompt=prompt,
             schema_path=args.schema.expanduser().resolve(),
             options=codex_cli.model_options_from_args(args),
             force=args.force,
         )
-    except (OSError, MetadataExtractionError) as exc:
+    except (OSError, codex_cli.CodexError) as exc:
         return codex_cli.report_error(parser, exc)
     return 0
 

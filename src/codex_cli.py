@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Shared non-interactive Codex CLI execution helpers."""
+"""Shared non-interactive agent CLI execution helpers.
+
+Two agent backends are supported: the OpenAI Codex CLI and the GitHub Copilot
+CLI.  A process selects one with ``select_backend``; entry points expose this
+as ``--backend``.  The library default remains Codex for compatibility.
+"""
 
 from __future__ import annotations
 
@@ -10,14 +15,19 @@ import hashlib
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import re
 import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
 from typing import Callable, Mapping
+import urllib.error
+import urllib.request
+import uuid
 
 from validation import common as validation_common
 from codex_transcripts import record_transcript
@@ -25,6 +35,66 @@ from codex_transcripts import record_transcript
 
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 WEB_SEARCH_MODES = ("disabled", "indexed", "live")
+BACKENDS = ("copilot", "codex")
+DEFAULT_BACKEND = "copilot"
+BACKEND_NAMES = {"copilot": "GitHub Copilot CLI", "codex": "Codex CLI"}
+COPILOT_UNSUPPORTED_REASONING_EFFORTS = frozenset({"ultra"})
+# Built-in Copilot tools that delegate to other agents, reach outside the
+# per-run workspace, or load user-installed extensions.
+COPILOT_EXCLUDED_TOOLS = (
+    "task",
+    "read_agent",
+    "write_agent",
+    "list_agents",
+    "run_dynamic_workflow",
+    "dynamic_workflows_manage",
+    "session_store_sql",
+    "skill",
+    "fetch_copilot_cli_documentation",
+    "semantic_code_search",
+    "web_fetch",
+)
+# Live web search adds this unsandboxed MCP server so agents can read pages
+# while shell commands stay offline; it refuses local and private addresses.
+COPILOT_FETCH_SERVER = "loose-ends-fetch"
+COPILOT_FETCH_SERVER_PATH = Path(__file__).resolve().with_name("copilot_fetch_mcp.py")
+COPILOT_HOME_ENV = "COPILOT_HOME"
+# Copilot may authenticate with these, so they stay in its own environment;
+# --secret-env-vars strips them and other credentials from agent shells.
+COPILOT_AUTH_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+COPILOT_SECRET_ENV_PATTERN = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|API_?KEY|ACCESS_?KEY"
+    r"|PRIVATE_?KEY|CONNECTION_?STRING|^COPILOT_GH_ACCOUNT_",
+    re.IGNORECASE,
+)
+COPILOT_ACCOUNT_CONFIG_KEYS = ("lastLoggedInUser", "loggedInUsers")
+COPILOT_READONLY_PATHS_ENV = "LOOSE_ENDS_COPILOT_READONLY_PATHS"
+COPILOT_USAGE_EVENT = "loose_ends.copilot_usage"
+# Copilot reports its session ID only at exit; this host-written event names
+# the invocation from launch so usage accounting can track in-progress turns.
+COPILOT_STARTED_EVENT = "loose_ends.copilot_started"
+COPILOT_USAGE_FILENAME = "usage.json"
+COPILOT_USAGE_SNAPSHOT_FILENAME = "usage.last.json"
+# A dropped connection ends a Copilot session with a transport error; the
+# driver waits for the network and resumes the same session instead.
+COPILOT_NETWORK_ERROR_RE = re.compile(
+    r"network fetch failed|error sending request|dns error|ENOTFOUND|EAI_AGAIN"
+    r"|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH"
+    r"|No such host is known|socket hang up",
+    re.IGNORECASE,
+)
+COPILOT_MAX_NETWORK_RESUMES = 10
+COPILOT_NETWORK_PROBE_URL = "https://api.github.com/"
+COPILOT_NETWORK_POLL_SECONDS = 30.0
+COPILOT_NETWORK_WAIT_SECONDS = 24 * 60 * 60.0
+COPILOT_RESUME_PROMPT = (
+    "The network connection was lost while you were working, and it is back "
+    "now. Continue the same task from where you stopped. Do not redo work "
+    "that is already complete in the working directory. Background shell "
+    "commands started before the interruption are no longer running, so "
+    "rerun any whose results you still need. Satisfy every requirement of "
+    "the original instructions, including the final result."
+)
 DEFAULT_MODEL = "gpt-6-astra"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_VALIDATION_PROMPT_PATH = (
@@ -62,7 +132,143 @@ _WINDOWS_RESERVED_DEVICE_NAMES = {
 
 
 class CodexError(RuntimeError):
-    """A local Codex invocation or its workspace could not be used."""
+    """A local agent invocation or its workspace could not be used."""
+
+
+_active_backend = "codex"
+
+
+def select_backend(backend: str) -> None:
+    """Choose the agent CLI used by subsequent runs in this process."""
+    global _active_backend
+    if backend not in BACKENDS:
+        raise CodexError("backend must be one of " + ", ".join(BACKENDS))
+    _active_backend = backend
+
+
+def active_backend() -> str:
+    return _active_backend
+
+
+def using_copilot() -> bool:
+    return _active_backend == "copilot"
+
+
+def backend_name() -> str:
+    return BACKEND_NAMES[_active_backend]
+
+
+def add_backend_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the agent-backend selector and the Copilot executable option."""
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default=DEFAULT_BACKEND,
+        help=f"agent CLI to run (default: {DEFAULT_BACKEND})",
+    )
+    parser.add_argument(
+        "--copilot",
+        default="copilot",
+        help="GitHub Copilot CLI executable or command name (default: copilot)",
+    )
+
+
+def validate_backend_options(args: argparse.Namespace) -> None:
+    """Reject Codex-only model options when the Copilot backend is selected."""
+    if getattr(args, "backend", "codex") != "copilot":
+        return
+    for name, value in sorted(vars(args).items()):
+        option = "--" + name.replace("_", "-")
+        if name.endswith(("fast", "ultrafast")) and value is True:
+            raise CodexError(
+                f"{option} is a Codex service tier; the Copilot backend does not support it"
+            )
+        if (
+            name.endswith("reasoning_effort")
+            and value in COPILOT_UNSUPPORTED_REASONING_EFFORTS
+        ):
+            raise CodexError(
+                f"{option} {value} is not supported by the Copilot backend"
+            )
+
+
+def agent_executable(args: argparse.Namespace) -> str:
+    """Select the requested backend and resolve its CLI executable."""
+    backend = getattr(args, "backend", "codex")
+    select_backend(backend)
+    validate_backend_options(args)
+    command = args.copilot if backend == "copilot" else args.codex
+    return resolve_codex_executable(command)
+
+
+def backend_arguments(args: argparse.Namespace) -> list[str]:
+    """Forward backend selection to a nested entry point."""
+    backend = getattr(args, "backend", "codex")
+    arguments = ["--backend", backend, "--codex", args.codex]
+    if hasattr(args, "copilot"):
+        arguments.extend(("--copilot", args.copilot))
+    return arguments
+
+
+def agent_credit_error(events_path: Path, log_path: Path | None = None) -> str | None:
+    if using_copilot():
+        return copilot_credit_error(events_path, log_path)
+    return codex_credit_error(events_path)
+
+
+COPILOT_CREDIT_PHRASES = (
+    "quota exceeded",
+    "out of credits",
+    "insufficient credits",
+    "usage limit",
+    "premium request limit",
+    "no remaining premium requests",
+    "ai credit limit",
+    "max ai credits",
+)
+
+
+def _copilot_credit_message(text: str) -> bool:
+    folded = text.casefold()
+    return any(phrase in folded for phrase in COPILOT_CREDIT_PHRASES)
+
+
+def copilot_credit_error(events_path: Path, log_path: Path | None = None) -> str | None:
+    """Recognize Copilot quota or credit exhaustion in error output."""
+    try:
+        with events_path.open(encoding="utf-8", errors="replace") as events:
+            for line in events:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                kind = str(event.get("type", ""))
+                if "error" not in kind and "fail" not in kind:
+                    continue
+                data = event.get("data")
+                fields = [event.get("message"), event.get("error")]
+                if isinstance(data, dict):
+                    fields.extend(
+                        (data.get("message"), data.get("error"), data.get("errorType"))
+                    )
+                for field in fields:
+                    if isinstance(field, dict):
+                        field = field.get("message")
+                    if isinstance(field, str) and _copilot_credit_message(field):
+                        return field
+    except OSError:
+        pass
+    if log_path is not None:
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            if "error" in line.casefold() and _copilot_credit_message(line):
+                return line.strip()
+    return None
 
 
 def codex_credit_error(events_path: Path) -> str | None:
@@ -424,7 +630,7 @@ def resolve_codex_executable(value: str) -> str:
     executable = shutil.which(value)
     if executable is None:
         raise CodexError(
-            f"could not find the Codex CLI executable {value!r} on PATH"
+            f"could not find the {backend_name()} executable {value!r} on PATH"
         )
     return executable
 
@@ -441,8 +647,15 @@ def read_codex_version(codex: str) -> str:
         raise CodexError(f"could not run {codex!r}: {exc}") from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or f"exit status {completed.returncode}"
-        raise CodexError(f"could not query the Codex CLI version: {detail}")
-    return completed.stdout.strip()
+        raise CodexError(f"could not query the {backend_name()} version: {detail}")
+    version = completed.stdout.strip()
+    if using_copilot():
+        # Copilot appends update hints after the version line.
+        version = next(
+            (line.strip().rstrip(".") for line in version.splitlines() if line.strip()),
+            "",
+        )
+    return version
 
 
 def is_windows_host() -> bool:
@@ -614,7 +827,7 @@ def require_secure_windows_sandbox(codex: str, workspace: Path) -> None:
     """Fail before model use when the elevated Windows helper is broken."""
     global _windows_sandbox_probe_error
     global _windows_sandbox_probe_succeeded
-    if not is_windows_host():
+    if not is_windows_host() or using_copilot():
         return
     with _WINDOWS_SANDBOX_PROBE_LOCK:
         if _windows_sandbox_probe_error is not None:
@@ -668,7 +881,7 @@ def note_windows_sandbox_failure(log_path: Path) -> None:
     """Prevent further model launches after an elevated-helper ACL failure."""
     global _windows_sandbox_probe_error
     global _windows_sandbox_probe_succeeded
-    if not is_windows_host():
+    if not is_windows_host() or using_copilot():
         return
     try:
         log = log_path.read_text(encoding="utf-8", errors="replace").lower()
@@ -696,7 +909,7 @@ def note_windows_sandbox_failure(log_path: Path) -> None:
 
 def grant_workspace_owner_inheritance(workspace: Path) -> None:
     """Make future sandbox-created children readable by the invoking user."""
-    if not is_windows_host():
+    if not is_windows_host() or using_copilot():
         return
     identity = windows_identity()
     _run_local_command(
@@ -712,7 +925,7 @@ def grant_workspace_owner_inheritance(workspace: Path) -> None:
 
 def grant_sandbox_read_access(path: Path) -> None:
     """Let the restricted Windows Codex sandbox read staged local inputs."""
-    if not is_windows_host():
+    if not is_windows_host() or using_copilot():
         return
     domain = windows_identity().split("\\", 1)[0]
     sandbox_group = f"{domain}\\CodexSandboxUsers"
@@ -794,6 +1007,16 @@ def normalize_workspace_access(workspace: Path, codex: str) -> None:
     with _WINDOWS_ACL_NORMALIZE_LOCK:
         if workspace_is_user_accessible(workspace):
             return
+        if using_copilot():
+            # Only Codex's elevated sandbox creates these ACLs, so repairing
+            # data left by an earlier Codex run still needs the Codex CLI.
+            repair_codex = shutil.which("codex")
+            if repair_codex is None:
+                raise CodexError(
+                    f"{workspace} has restrictive ACLs from an earlier Codex "
+                    "sandbox run; install the Codex CLI to repair them"
+                )
+            codex = repair_codex
         identity = windows_identity()
         command_prefix = [
             codex,
@@ -902,20 +1125,28 @@ def is_transient_startup_failure(
 
 
 def structured_turn_is_complete(events_path: Path, result_path: Path) -> bool:
-    """Return whether Codex wrote both its final event and valid JSON result."""
+    """Return whether the agent wrote both its final event and valid JSON result."""
     try:
         with result_path.open(encoding="utf-8") as source:
             json.load(source)
         with events_path.open(encoding="utf-8") as source:
             return any(
-                isinstance(event, dict)
-                and event.get("type") == "turn.completed"
+                _is_final_success_event(event)
                 for line in source
                 if line.strip()
                 for event in (json.loads(line),)
             )
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
+
+
+def _is_final_success_event(event: object) -> bool:
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") == "turn.completed":
+        return True
+    # Copilot CLI ends each prompt-mode session with a single result event.
+    return event.get("type") == "result" and event.get("exitCode") == 0
 
 
 def _stop_codex_process(process: subprocess.Popen) -> None:
@@ -1097,8 +1328,24 @@ def codex_home_warnings(environment: Mapping[str, str] | None = None) -> list[st
 
 
 def report_codex_home_warnings() -> None:
-    for warning in codex_home_warnings():
+    warnings = copilot_environment_warnings() if using_copilot() else codex_home_warnings()
+    for warning in warnings:
         print(f"Warning: {warning}", file=sys.stderr)
+
+
+def copilot_environment_warnings(
+    environment: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Check prerequisites for sandboxed Copilot turns without starting one."""
+    environment = codex_subprocess_environment() if environment is None else environment
+    warnings = []
+    if shutil.which("python", path=environment.get("PATH")) is None:
+        warnings.append(
+            "No regular Python interpreter is on PATH. Copilot's sandbox cannot "
+            "start the Microsoft Store python.exe alias, and agents must run "
+            "`python -m validation.validate`; install Python from python.org."
+        )
+    return warnings
 
 
 def codex_account_config_overrides() -> list[str]:
@@ -1148,6 +1395,442 @@ def codex_account_config_overrides() -> list[str]:
     for key, value in settings.items():
         overrides.extend(("--config", f"{key}={_toml_value(value)}"))
     return overrides
+
+
+def configure_backend(args: argparse.Namespace) -> None:
+    """Apply an entry point's --backend choice before any agent work."""
+    select_backend(getattr(args, "backend", "codex"))
+    validate_backend_options(args)
+
+
+def copilot_readonly_paths(environment: Mapping[str, str] | None = None) -> list[str]:
+    """Return toolchain roots the sandboxed shell must read but never modify."""
+    environment = codex_subprocess_environment() if environment is None else environment
+    candidates: list[Path] = []
+    for name in ("latexmk", "pdflatex", "kpsewhich"):
+        executable = shutil.which(name, path=environment.get("PATH"))
+        if executable is None:
+            continue
+        resolved = Path(executable).resolve()
+        # TeX Live and MiKTeX install binaries as <root>/bin/<platform>/<tool>.
+        if resolved.parent.parent.name.casefold() == "bin":
+            root = resolved.parent.parent.parent
+            candidates.append(root)
+            local = root.parent / "texmf-local"
+            if local.is_dir():
+                candidates.append(local)
+    extra = environment.get(COPILOT_READONLY_PATHS_ENV, "")
+    candidates.extend(Path(value).expanduser() for value in extra.split(os.pathsep) if value)
+    paths: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = path_for_codex(candidate)
+        key = os.path.normcase(value)
+        if key not in seen:
+            seen.add(key)
+            paths.append(value)
+    return paths
+
+
+def copilot_sandbox_settings(
+    web_search: str = "disabled",
+    *,
+    readonly_paths: list[str] | None = None,
+) -> dict[str, object]:
+    """Build the per-run Copilot sandbox policy for shell commands."""
+    policy: dict[str, object] = {
+        "network": {"allowOutbound": False, "allowLocalNetwork": False},
+    }
+    readonly = copilot_readonly_paths() if readonly_paths is None else readonly_paths
+    if readonly:
+        policy["filesystem"] = {"readonlyPaths": readonly}
+    sandbox: dict[str, object] = {
+        "enabled": True,
+        "allowBypass": False,
+        "addCurrentWorkingDirectory": True,
+        # Lets sandboxed commands run toolchains on PATH, such as Python.
+        "allowDevToolAccess": True,
+        "userPolicy": policy,
+    }
+    if web_search != "disabled":
+        # GitHub's remote web-search MCP server needs egress; shell commands
+        # remain offline because the network policy above still applies.
+        sandbox["sandboxMcpServers"] = False
+    return {"sandbox": sandbox}
+
+
+def source_copilot_home(environment: Mapping[str, str] | None = None) -> Path:
+    environment = os.environ if environment is None else environment
+    home = environment.get(COPILOT_HOME_ENV)
+    return Path(home).expanduser() if home else Path.home() / ".copilot"
+
+
+def _read_jsonc_object(path: Path) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return {}
+    text = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("//")
+    )
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def prepare_copilot_home(web_search: str = "disabled") -> Path:
+    """Create an isolated COPILOT_HOME holding only the sandbox policy.
+
+    This keeps user MCP servers, plugins, agents, and instructions out of the
+    run while authentication still comes from the OS credential store.
+    """
+    home = Path(tempfile.mkdtemp(prefix="loose-ends-copilot-")).resolve()
+    (home / "settings.json").write_text(
+        json.dumps(copilot_sandbox_settings(web_search), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    config = _read_jsonc_object(source_copilot_home() / "config.json")
+    account = {key: config[key] for key in COPILOT_ACCOUNT_CONFIG_KEYS if key in config}
+    if account:
+        (home / "config.json").write_text(
+            json.dumps(account, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return home
+
+
+def copilot_secret_env_vars(environment: Mapping[str, str]) -> list[str]:
+    """Name credential-like variables to hide from Copilot's agent shells."""
+    names = {
+        name
+        for name in environment
+        if COPILOT_SECRET_ENV_PATTERN.search(name) and "," not in name
+    }
+    names.update(COPILOT_AUTH_ENV_VARS)
+    return sorted(names)
+
+
+def copilot_fetch_mcp_config(workspace: Path) -> dict:
+    """Describe the page-fetch MCP server for one live-web-search run."""
+    return {
+        "mcpServers": {
+            COPILOT_FETCH_SERVER: {
+                "type": "local",
+                "command": sys.executable,
+                "args": [
+                    str(COPILOT_FETCH_SERVER_PATH),
+                    "--workspace",
+                    str(Path(workspace).resolve()),
+                ],
+                "tools": ["*"],
+            }
+        }
+    }
+
+
+def build_copilot_command(
+    *,
+    copilot: str,
+    workspace: Path,
+    options: ModelOptions,
+    usage_path: Path,
+    web_search: str = "disabled",
+    environment: Mapping[str, str] | None = None,
+    session_id: str | None = None,
+) -> list[str]:
+    if web_search not in WEB_SEARCH_MODES:
+        raise CodexError(
+            "web search must be one of " + ", ".join(WEB_SEARCH_MODES)
+        )
+    if options.fast or options.ultrafast:
+        raise CodexError("the Copilot backend does not support Fast or Ultrafast mode")
+    if options.reasoning_effort in COPILOT_UNSUPPORTED_REASONING_EFFORTS:
+        raise CodexError(
+            f"the Copilot backend does not support reasoning effort {options.reasoning_effort}"
+        )
+    command = [
+        copilot,
+        "--output-format",
+        "json",
+        "--stream",
+        "off",
+        "--allow-all-tools",
+        "--no-ask-user",
+        "--no-custom-instructions",
+        "--no-auto-update",
+        "--sandbox",
+        "-C",
+        path_for_codex(workspace),
+        "--usage-output-file",
+        path_for_codex(usage_path),
+    ]
+    if web_search == "disabled":
+        command.append("--disable-builtin-mcps")
+    else:
+        # Copilot has a single web-search tool, so indexed and live match.
+        command.extend(
+            (
+                "--disable-mcp-server",
+                "githubiq",
+                "--add-github-mcp-tool",
+                "web_search",
+            )
+        )
+    if web_search == "live":
+        command.extend(
+            ("--additional-mcp-config", json.dumps(copilot_fetch_mcp_config(workspace)))
+        )
+    if options.model is not None:
+        command.extend(("--model", options.model))
+    if options.reasoning_effort is not None:
+        command.extend(("--reasoning-effort", options.reasoning_effort))
+    if session_id is not None:
+        command.extend(("--session-id", session_id))
+    environment = os.environ if environment is None else environment
+    command.append("--secret-env-vars=" + ",".join(copilot_secret_env_vars(environment)))
+    # Variadic, so it stays last; the prompt is read from standard input.
+    command.extend(("--excluded-tools", *COPILOT_EXCLUDED_TOOLS))
+    return command
+
+
+def copilot_usage_event(
+    usage_path: Path,
+    events_path: Path,
+    invocation_id: str | None = None,
+) -> dict | None:
+    """Summarize a Copilot usage file as one Codex-comparable usage event."""
+    usage = _read_jsonc_object(usage_path)
+    metrics = usage.get("modelMetrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return None
+    fields = {
+        "input_tokens": "inputTokens",
+        "cached_input_tokens": "cacheReadTokens",
+        "cache_write_input_tokens": "cacheWriteTokens",
+        "output_tokens": "outputTokens",
+        "reasoning_output_tokens": "reasoningTokens",
+    }
+    totals = dict.fromkeys(fields, 0)
+    models: dict[str, dict[str, int]] = {}
+    for model, metric in metrics.items():
+        counts = metric.get("usage") if isinstance(metric, dict) else None
+        if not isinstance(counts, dict):
+            continue
+        values = {
+            name: counts.get(source) if type(counts.get(source)) is int else 0
+            for name, source in fields.items()
+        }
+        models[str(model)] = values
+        for name, value in values.items():
+            totals[name] += value
+    session_id = None
+    try:
+        with events_path.open(encoding="utf-8", errors="replace") as events:
+            for line in events:
+                if '"result"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "result":
+                    session_id = event.get("sessionId", session_id)
+    except OSError:
+        pass
+    return {
+        "type": COPILOT_USAGE_EVENT,
+        "invocation_id": invocation_id,
+        "session_id": session_id,
+        "model": usage.get("currentModel") or next(iter(models), None),
+        "models": models,
+        "usage": totals,
+        "nano_aiu": usage.get("totalNanoAiu"),
+        "premium_requests": usage.get("totalPremiumRequestCost"),
+    }
+
+
+def _append_event(events_path: Path, event: dict) -> None:
+    with events_path.open("a", encoding="utf-8") as events:
+        events.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def append_copilot_usage_event(
+    usage_path: Path,
+    events_path: Path,
+    invocation_id: str | None = None,
+) -> None:
+    event = copilot_usage_event(usage_path, events_path, invocation_id)
+    if event is None:
+        snapshot = usage_path.with_name(COPILOT_USAGE_SNAPSHOT_FILENAME)
+        if snapshot.is_file():
+            event = copilot_usage_event(snapshot, events_path, invocation_id)
+    if event is None:
+        return
+    _append_event(events_path, event)
+
+
+def snapshot_copilot_usage(usage_path: Path) -> None:
+    """Keep the last usage file with metrics in case a resume overwrites it."""
+    usage = _read_jsonc_object(usage_path)
+    metrics = usage.get("modelMetrics")
+    if isinstance(metrics, dict) and metrics:
+        try:
+            shutil.copyfile(
+                usage_path,
+                usage_path.with_name(COPILOT_USAGE_SNAPSHOT_FILENAME),
+            )
+        except OSError:
+            pass
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_from(path: Path, offset: int) -> str:
+    try:
+        with path.open("rb") as source:
+            source.seek(offset)
+            return source.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def copilot_network_failure(
+    events_path: Path,
+    log_path: Path,
+    *,
+    events_offset: int = 0,
+    log_offset: int = 0,
+) -> str | None:
+    """Return the network error that ended a Copilot process, if any."""
+    for line in _read_from(events_path, events_offset).splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "session.error":
+            continue
+        data = event.get("data")
+        message = data.get("message") if isinstance(data, dict) else None
+        if isinstance(message, str) and COPILOT_NETWORK_ERROR_RE.search(message):
+            return message.strip()
+    for line in _read_from(log_path, log_offset).splitlines():
+        if COPILOT_NETWORK_ERROR_RE.search(line):
+            return line.strip()
+    return None
+
+
+def copilot_session_started(events_path: Path) -> bool:
+    """Return whether Copilot recorded the prompt in its session."""
+    for line in _read_from(events_path, 0).splitlines():
+        if '"user.message"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "user.message":
+            return True
+    return False
+
+
+def wait_for_network(max_seconds: float = COPILOT_NETWORK_WAIT_SECONDS) -> bool:
+    """Poll GitHub until it answers, returning False after max_seconds."""
+    deadline = time.monotonic() + max_seconds
+    while True:
+        request = urllib.request.Request(COPILOT_NETWORK_PROBE_URL, method="HEAD")
+        try:
+            with urllib.request.urlopen(request, timeout=15):
+                return True
+        except urllib.error.HTTPError:
+            return True
+        except (OSError, ValueError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(COPILOT_NETWORK_POLL_SECONDS, remaining))
+
+
+def copilot_final_message(events_path: Path) -> str | None:
+    """Return the last nonempty assistant message from Copilot JSONL output."""
+    message = None
+    try:
+        with events_path.open(encoding="utf-8", errors="replace") as events:
+            for line in events:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "assistant.message":
+                    continue
+                data = event.get("data")
+                content = data.get("content") if isinstance(data, dict) else None
+                if isinstance(content, str) and content.strip():
+                    message = content
+    except OSError:
+        return None
+    return message
+
+
+def _json_object_from_message(message: str) -> object:
+    text = message.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    return json.loads(text)
+
+
+def with_copilot_result_instructions(
+    prompt: str,
+    *,
+    workspace: Path,
+    schema_path: Path,
+    result_path: Path,
+) -> str:
+    """Replace Codex's --output-schema contract with explicit instructions."""
+    schema = schema_path.resolve()
+    schema_reference = (
+        schema.relative_to(workspace).as_posix()
+        if schema.is_relative_to(workspace)
+        else path_for_codex(schema)
+    )
+    return (
+        prompt.rstrip()
+        + "\n\n# Final result\n\n"
+        + f"Before finishing, write your final result as a single JSON object to "
+        + f"`{result_path.relative_to(workspace).as_posix()}` in the working "
+        + f"directory. It must conform exactly to the JSON Schema in "
+        + f"`{schema_reference}`. Your final message must be the same JSON "
+        + "object and nothing else.\n"
+    )
+
+
+def recover_copilot_result(events_path: Path, result_path: Path) -> None:
+    """Fall back to the final assistant message when no result file exists."""
+    try:
+        with result_path.open(encoding="utf-8") as source:
+            json.load(source)
+        return
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    message = copilot_final_message(events_path)
+    if message is None:
+        return
+    try:
+        value = _json_object_from_message(message)
+    except json.JSONDecodeError:
+        return
+    result_path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_exec_command(
@@ -1245,7 +1928,48 @@ def run_structured_codex(
     completion_grace_seconds: float | None = None,
     model_writes_result: bool = False,
 ) -> Path:
-    """Run one structured Codex turn and return its final-response path."""
+    """Run one structured agent turn and return its final-response path."""
+    arguments = dict(
+        codex=codex,
+        workspace=workspace,
+        prompt=prompt,
+        schema_path=schema_path,
+        result_filename=result_filename,
+        events_filename=events_filename,
+        log_filename=log_filename,
+        options=options,
+        web_search=web_search,
+        launch_interval=launch_interval,
+        timeout_seconds=timeout_seconds,
+        completion_grace_seconds=completion_grace_seconds,
+        model_writes_result=model_writes_result,
+    )
+    if not using_copilot():
+        return _run_structured_turn(**arguments, copilot_home=None)
+    copilot_home = prepare_copilot_home(web_search)
+    try:
+        return _run_structured_turn(**arguments, copilot_home=copilot_home)
+    finally:
+        shutil.rmtree(copilot_home, ignore_errors=True)
+
+
+def _run_structured_turn(
+    *,
+    codex: str,
+    workspace: Path,
+    prompt: str,
+    schema_path: Path,
+    result_filename: str,
+    events_filename: str,
+    log_filename: str,
+    options: ModelOptions,
+    web_search: str,
+    launch_interval: float,
+    timeout_seconds: float | None,
+    completion_grace_seconds: float | None,
+    model_writes_result: bool,
+    copilot_home: Path | None,
+) -> Path:
     workspace = workspace.resolve()
     grant_workspace_owner_inheritance(workspace)
     require_secure_windows_sandbox(codex, workspace)
@@ -1254,96 +1978,184 @@ def run_structured_codex(
     log_path = workspace / log_filename
     events_path.write_text("", encoding="utf-8")
     log_path.write_text("", encoding="utf-8")
-    command = build_exec_command(
-        codex=codex,
-        workspace=workspace,
-        prompt=prompt,
-        schema_path=schema_path,
-        result_path=result_path,
-        options=options,
-        web_search=web_search,
-        model_writes_result=model_writes_result,
-    )
     environment = codex_subprocess_environment()
+    usage_path: Path | None = None
+    invocation_id: str | None = None
+    session_id: str | None = None
+    if copilot_home is not None:
+        usage_path = copilot_home / COPILOT_USAGE_FILENAME
+        invocation_id = uuid.uuid4().hex
+        session_id = str(uuid.uuid4())
+        _append_event(
+            events_path,
+            {"type": COPILOT_STARTED_EVENT, "invocation_id": invocation_id},
+        )
+        if not model_writes_result:
+            prompt = with_copilot_result_instructions(
+                prompt,
+                workspace=workspace,
+                schema_path=schema_path,
+                result_path=result_path,
+            )
+        command = build_copilot_command(
+            copilot=codex,
+            workspace=workspace,
+            options=options,
+            usage_path=usage_path,
+            web_search=web_search,
+            environment=environment,
+            session_id=session_id,
+        )
+        environment[COPILOT_HOME_ENV] = str(copilot_home)
+    else:
+        command = build_exec_command(
+            codex=codex,
+            workspace=workspace,
+            prompt=prompt,
+            schema_path=schema_path,
+            result_path=result_path,
+            options=options,
+            web_search=web_search,
+            model_writes_result=model_writes_result,
+        )
+    agent = backend_name()
 
     completed: subprocess.CompletedProcess | None = None
     structured_result_complete = False
     timed_out = False
-    for attempt in range(1, MAX_CODEX_START_ATTEMPTS + 1):
-        wait_for_codex_launch_slot(launch_interval)
-        try:
-            with (
-                events_path.open("a", encoding="utf-8") as events,
-                log_path.open("a", encoding="utf-8") as log,
-            ):
-                if attempt > 1:
-                    log.write(
-                        f"\n--- Codex startup retry {attempt}/"
-                        f"{MAX_CODEX_START_ATTEMPTS} ---\n"
-                    )
-                    log.flush()
-                if (
-                    timeout_seconds is None
-                    and completion_grace_seconds is None
+    credit_error: str | None = None
+    deadline = (
+        None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    )
+    turn_prompt = prompt
+    resumes = 0
+    while True:
+        events_offset = _file_size(events_path)
+        log_offset = _file_size(log_path)
+        remaining_seconds = (
+            None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        )
+        for attempt in range(1, MAX_CODEX_START_ATTEMPTS + 1):
+            wait_for_codex_launch_slot(launch_interval)
+            try:
+                with (
+                    events_path.open("a", encoding="utf-8") as events,
+                    log_path.open("a", encoding="utf-8") as log,
                 ):
-                    completed = subprocess.run(
-                        command,
-                        cwd=workspace,
-                        env=environment,
-                        input=prompt,
-                        stdout=events,
-                        stderr=log,
-                        text=True,
-                        encoding="utf-8",
-                        check=False,
-                    )
-                else:
-                    (
-                        completed,
-                        structured_result_complete,
-                        timed_out,
-                    ) = _run_codex_process(
-                        command,
-                        prompt=prompt,
-                        workspace=workspace,
-                        environment=environment,
-                        events=events,
-                        log=log,
-                        events_path=events_path,
-                        result_path=result_path,
-                        timeout_seconds=timeout_seconds,
-                        completion_grace_seconds=completion_grace_seconds,
-                    )
-        except OSError as exc:
-            if (
-                attempt < MAX_CODEX_START_ATTEMPTS
-                and getattr(exc, "winerror", None) in {2, 3}
-            ):
-                with log_path.open("a", encoding="utf-8") as log:
-                    log.write(f"Codex startup error: {exc}\n")
-                continue
-            raise CodexError(
-                f"could not start Codex; workspace preserved at "
-                f"{workspace}: {exc}"
-            ) from exc
+                    if attempt > 1:
+                        log.write(
+                            f"\n--- {agent} startup retry {attempt}/"
+                            f"{MAX_CODEX_START_ATTEMPTS} ---\n"
+                        )
+                        log.flush()
+                    if (
+                        timeout_seconds is None
+                        and completion_grace_seconds is None
+                    ):
+                        completed = subprocess.run(
+                            command,
+                            cwd=workspace,
+                            env=environment,
+                            input=turn_prompt,
+                            stdout=events,
+                            stderr=log,
+                            text=True,
+                            encoding="utf-8",
+                            check=False,
+                        )
+                    else:
+                        (
+                            completed,
+                            structured_result_complete,
+                            timed_out,
+                        ) = _run_codex_process(
+                            command,
+                            prompt=turn_prompt,
+                            workspace=workspace,
+                            environment=environment,
+                            events=events,
+                            log=log,
+                            events_path=events_path,
+                            result_path=result_path,
+                            timeout_seconds=remaining_seconds,
+                            completion_grace_seconds=completion_grace_seconds,
+                        )
+            except OSError as exc:
+                if (
+                    attempt < MAX_CODEX_START_ATTEMPTS
+                    and getattr(exc, "winerror", None) in {2, 3}
+                ):
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(f"{agent} startup error: {exc}\n")
+                    continue
+                raise CodexError(
+                    f"could not start {agent}; workspace preserved at "
+                    f"{workspace}: {exc}"
+                ) from exc
 
-        credit_error = codex_credit_error(events_path)
-        if credit_error is not None:
-            pause_queue_for_credit_error(credit_error)
-            break
-        if completed.returncode == 0 or structured_result_complete or timed_out:
-            break
+            credit_error = agent_credit_error(events_path, log_path)
+            if credit_error is not None:
+                pause_queue_for_credit_error(credit_error)
+                break
+            if completed.returncode == 0 or structured_result_complete or timed_out:
+                break
+            if (
+                attempt == MAX_CODEX_START_ATTEMPTS
+                or not is_transient_startup_failure(
+                    completed,
+                    events_path,
+                    log_path,
+                )
+            ):
+                break
+
+        if usage_path is not None:
+            snapshot_copilot_usage(usage_path)
         if (
-            attempt == MAX_CODEX_START_ATTEMPTS
-            or not is_transient_startup_failure(
-                completed,
-                events_path,
-                log_path,
-            )
+            session_id is None
+            or completed is None
+            or completed.returncode == 0
+            or structured_result_complete
+            or timed_out
+            or credit_error is not None
+            or resumes >= COPILOT_MAX_NETWORK_RESUMES
         ):
             break
+        failure = copilot_network_failure(
+            events_path,
+            log_path,
+            events_offset=events_offset,
+            log_offset=log_offset,
+        )
+        if failure is None:
+            break
+        resumes += 1
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(
+                f"\nDriver: {agent} lost its network connection ({failure}); "
+                f"waiting for the network to resume the session "
+                f"({resumes}/{COPILOT_MAX_NETWORK_RESUMES}).\n"
+            )
+        wait_seconds = COPILOT_NETWORK_WAIT_SECONDS
+        if deadline is not None:
+            wait_seconds = min(wait_seconds, deadline - time.monotonic())
+        if wait_seconds <= 0 or not wait_for_network(wait_seconds):
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write("Driver: the network did not return; giving up.\n")
+            break
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(
+                f"\n--- {agent} network resume {resumes}/"
+                f"{COPILOT_MAX_NETWORK_RESUMES} ---\n"
+            )
+        if copilot_session_started(events_path):
+            turn_prompt = COPILOT_RESUME_PROMPT
 
     note_windows_sandbox_failure(log_path)
+    if usage_path is not None:
+        append_copilot_usage_event(usage_path, events_path, invocation_id)
+        if not model_writes_result:
+            recover_copilot_result(events_path, result_path)
     try:
         normalize_workspace_access(workspace, codex)
     except CodexError as exc:
@@ -1353,12 +2165,12 @@ def run_structured_codex(
             log.write(f"\nDriver ACL recovery warning: {exc}\n")
     if credit_error is not None:
         raise CodexError(
-            f"Codex credits exhausted: {credit_error}; "
+            f"{agent} credits exhausted: {credit_error}; "
             f"workspace preserved at {workspace}"
         )
     if timed_out:
         raise CodexError(
-            f"Codex exceeded the {timeout_seconds:g}-second wall-clock "
+            f"{agent} exceeded the {timeout_seconds:g}-second wall-clock "
             f"timeout; workspace preserved at {workspace}"
         )
     if (
@@ -1367,7 +2179,7 @@ def run_structured_codex(
     ):
         returncode = completed.returncode if completed is not None else "unknown"
         raise CodexError(
-            f"Codex exited with status {returncode}; "
+            f"{agent} exited with status {returncode}; "
             f"workspace preserved at {workspace}"
         )
     return result_path
@@ -1448,7 +2260,7 @@ def run_validated_codex(
         if report.valid or not report.repairable:
             break
         repair_prompt = (
-            "The previous Codex turn left generated output that failed the "
+            "The previous agent turn left generated output that failed the "
             "authoritative deterministic validator. Preserve all substantive "
             "work and staged inputs. Fix only the reported output-contract "
             "issues, run `python -m validation.validate` until it passes, and "

@@ -1272,6 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="Codex CLI executable or command name (default: codex)",
     )
+    codex_cli.add_backend_arguments(parser)
     codex_cli.add_prompt_arguments(
         parser,
         default_template=DEFAULT_PROMPT_PATH,
@@ -1311,6 +1312,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        codex_cli.configure_backend(args)
         input_paths, direct_exact = common.direct_problem_inputs(args.paths)
         if direct_exact and (
             args.from_triage is not None
@@ -1458,7 +1460,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     try:
-        codex = codex_cli.resolve_codex_executable(args.codex)
+        codex = codex_cli.agent_executable(args)
         codex_version = codex_cli.read_codex_version(codex)
         # Probe once before announcing or submitting the batch.  Per-turn
         # probing remains as a guard against a helper that fails later, but a
@@ -1468,10 +1470,11 @@ def main(argv: list[str] | None = None) -> int:
     except common.CodexError as exc:
         return codex_cli.report_error(parser, exc)
     agent_count = min(args.jobs, len(work_items))
+    agent = codex_cli.backend_name()
     if agent_count == 1:
-        concurrency = "sequentially with 1 Codex agent"
+        concurrency = f"sequentially with 1 {agent} agent"
     else:
-        concurrency = f"with up to {agent_count} concurrent Codex agents"
+        concurrency = f"with up to {agent_count} concurrent {agent} agents"
     round_phrase = (
         "one round"
         if args.max_rounds == 1

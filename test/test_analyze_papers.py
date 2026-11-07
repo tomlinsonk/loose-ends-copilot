@@ -526,7 +526,9 @@ class MainOutputTests(unittest.TestCase):
 
             error = StringIO()
             with redirect_stdout(output), redirect_stderr(error):
-                returncode = analyze_papers.main([str(paper), "--dry-run"])
+                returncode = analyze_papers.main(
+                    [str(paper), "--dry-run", "--backend", "codex"]
+                )
 
         self.assertEqual(returncode, 0)
         self.assertIn(f"Would analyze: {paper}", output.getvalue())
