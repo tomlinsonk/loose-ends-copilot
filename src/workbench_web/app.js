@@ -3733,13 +3733,13 @@ function renderJobDetail(job) {
     }
     const codexExpanded = state.expandedCodexRuns.has(run.id);
     const codexFooter = node("div", "run-detail-footer");
-    const codexToggle = button(`${codexExpanded ? "Hide" : "Show"} Codex transcript`, () => {
+    const codexToggle = button(`${codexExpanded ? "Hide" : "Show"} agent transcript`, () => {
       if (state.expandedCodexRuns.has(run.id)) state.expandedCodexRuns.delete(run.id);
       else state.expandedCodexRuns.add(run.id);
       renderJobDetail(job);
     }, "run-detail-toggle");
     codexToggle.setAttribute("aria-expanded", String(codexExpanded));
-    codexToggle.setAttribute("aria-label", `${codexExpanded ? "Hide" : "Show"} Codex transcript for ${presentation.title}`);
+    codexToggle.setAttribute("aria-label", `${codexExpanded ? "Hide" : "Show"} agent transcript for ${presentation.title}`);
     codexToggle.prepend(node("span", "run-chevron", "›"));
     codexFooter.append(codexToggle);
     section.append(codexFooter);
@@ -3871,7 +3871,7 @@ function catalogTranscriptFold(kind, item) {
 function codexTranscript(source) {
   const element = node("section", "codex-transcripts");
   element.dataset.codexSource = source;
-  element.append(node("h3", "", "Codex transcript"));
+  element.append(node("h3", "", "Agent transcript"));
   return element;
 }
 
@@ -3879,6 +3879,49 @@ function refreshVisibleCodexLogs() {
   main.querySelectorAll("[data-codex-source]").forEach(element => {
     refreshCodexLogs(element.dataset.codexSource, element);
   });
+}
+
+// Translates Copilot CLI JSONL events into the Codex item shapes rendered below.
+function copilotItem(event, items, turn, next) {
+  const data = event.data && typeof event.data === "object" ? event.data : {};
+  const tool = data.toolCallId ? `${turn}:${data.toolCallId}` : null;
+  switch (event.type) {
+    case "assistant.message":
+      if (data.content) items.set(`${turn}:${data.messageId ?? next()}`, { type: "agent_message", text: data.content });
+      return true;
+    case "tool.execution_start": {
+      const args = data.arguments && typeof data.arguments === "object" ? data.arguments : {};
+      const detail = args.command ?? args.path ?? args.pattern ?? args.query ?? args.url;
+      items.set(tool ?? `tool:${next()}`, {
+        type: data.toolName || "tool", command: typeof detail === "string" ? detail : undefined,
+        status: "in_progress", aggregated_output: "", arguments: args,
+      });
+      return true;
+    }
+    case "tool.shell_output": {
+      const item = tool && items.get(tool);
+      if (item && item.status === "in_progress") item.aggregated_output += data.text || "";
+      return true;
+    }
+    case "tool.execution_complete": {
+      const item = (tool && items.get(tool)) || { type: "tool" };
+      item.status = data.success === false ? "failed" : "completed";
+      item.aggregated_output = data.result?.content ?? data.error?.message ?? item.aggregated_output ?? "";
+      items.set(tool ?? `tool:${next()}`, item);
+      return true;
+    }
+    case "session.error":
+      items.set(`error:${next()}`, { type: "error", text: data.message || JSON.stringify(data) });
+      return true;
+    case "loose_ends.copilot_usage":
+      items.set(`usage:${next()}`, { type: "usage", text: JSON.stringify(event.usage || {}) });
+      return true;
+    case "result":
+      if (event.exitCode !== 0) items.set(`error:${next()}`, { type: "error", text: `Copilot exited with code ${event.exitCode}` });
+      return true;
+    default:
+      return typeof event.type === "string" && /^(session|assistant|user|tool|model|loose_ends)\./.test(event.type);
+  }
 }
 
 function codexItems(text) {
@@ -3889,7 +3932,8 @@ function codexItems(text) {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
     if (!event || typeof event !== "object") continue;
-    if (event.type === "thread.started" || event.type === "turn.started") turn++;
+    if (event.type === "thread.started" || event.type === "turn.started" || event.type === "loose_ends.copilot_started") turn++;
+    if (copilotItem(event, items, turn, () => sequence++)) continue;
     if (event.item && typeof event.item === "object") {
       items.set(`${turn}:${event.item.id ?? sequence++}`, event.item);
     } else if (event.type === "error" || event.type === "turn.failed") {
@@ -3902,9 +3946,9 @@ function codexItems(text) {
 }
 
 function renderCodexTranscript(element, transcripts) {
-  element.replaceChildren(node("h3", "", "Codex transcript"));
+  element.replaceChildren(node("h3", "", "Agent transcript"));
   if (!transcripts.length) {
-    element.append(node("p", "muted", "No saved Codex transcript available yet."));
+    element.append(node("p", "muted", "No saved agent transcript available yet."));
   }
   for (const transcript of transcripts) {
     element.append(node("h4", "codex-invocation-heading", transcript.label));
@@ -3963,12 +4007,18 @@ async function refreshCodexLogs(source, element) {
       for (const kind of ["prompt", "events", "diagnostics"]) {
         // Older transcripts have no saved prompt.
         if (kind === "prompt" && entry.legacy) continue;
-        const previous = transcript.files[kind] || {};
-        if (previous.complete) continue;
-        const result = await api(`${source}${source.includes("?") ? "&" : "?"}${new URLSearchParams({ id: entry.id, kind, offset: previous.nextOffset || 0 })}`);
-        transcript.files[kind] = result;
-        transcript[kind] = (transcript[kind] || "") + result.text;
-        if (result.text) changed = true;
+        let previous = transcript.files[kind] || {};
+        // Fetch every available page now; waiting between pages made long
+        // transcripts grow for minutes and re-render after each page.
+        while (!previous.complete) {
+          const offset = previous.nextOffset || 0;
+          const result = await api(`${source}${source.includes("?") ? "&" : "?"}${new URLSearchParams({ id: entry.id, kind, offset })}`);
+          transcript.files[kind] = result;
+          transcript[kind] = (transcript[kind] || "") + result.text;
+          if (!result.text || !(result.nextOffset > offset)) break;
+          changed = true;
+          previous = result;
+        }
       }
     }
     state.codexLogs.set(source, cached);
@@ -3978,9 +4028,11 @@ async function refreshCodexLogs(source, element) {
       if (current.dataset.codexSource !== source || (!changed && current === element)) return;
       const expanded = [...current.querySelectorAll("details")].map(value => value.open);
       const scrollTop = current.scrollTop;
+      const followBottom = scrollTop > 0 &&
+        current.scrollHeight - scrollTop - current.clientHeight <= 24;
       renderCodexTranscript(current, cached);
       current.querySelectorAll("details").forEach((value, index) => { value.open = expanded[index] || false; });
-      current.scrollTop = scrollTop;
+      current.scrollTop = followBottom ? current.scrollHeight : scrollTop;
     });
   } catch (error) {
     if (element.isConnected && !cached.length) element.replaceChildren(node("p", "error-box", error.message));
@@ -4606,7 +4658,9 @@ function field(name, label, { type = "text", value = "", placeholder = "", help 
   return wrapper;
 }
 
-function modelField(name, label, value, defaultLabel) {
+const backendNames = { copilot: "GitHub Copilot CLI", codex: "Codex CLI" };
+
+function modelField(name, label, value, defaultLabel, copilot = false) {
   const options = [
     ["", defaultLabel],
     ["gpt-6.1-sol", "GPT-6.1 Sol"],
@@ -4614,6 +4668,11 @@ function modelField(name, label, value, defaultLabel) {
     ["gpt-5.6-sol", "GPT-5.6 Sol"],
     ["gpt-5.6-terra", "GPT-5.6 Terra"],
     ["gpt-5.6-luna", "GPT-5.6 Luna"],
+    ...(copilot ? [
+      ["claude-opus-5.5", "Claude Opus 5.5"],
+      ["claude-sonnet-5.5", "Claude Sonnet 5.5"],
+      ["gemini-4-argon", "Gemini 4 Argon"],
+    ] : []),
   ];
   // Preserve model IDs from saved task drafts, including older models.
   if (value && !options.some(([id]) => id === value)) options.push([value, value]);
@@ -4992,14 +5051,28 @@ function renderTaskConfiguration(errorMessage = "") {
   modelSettings.append(node("h3", "", "Model and web-search settings"));
   const advancedGrid = node("div", "form-grid");
   const taskDefaults = state.settings.taskDefaults?.[task.action] || {};
+  const backend = options.backend || taskDefaults.backend || "copilot";
+  const copilot = backend === "copilot";
+  const efforts = ["low", "medium", "high", "xhigh", "max", ...(copilot ? [] : ["ultra"])];
+  const backendField = field("backend", "Agent CLI", {
+    type: "select", value: options.backend || "",
+    options: [["", `Default (${backendNames[taskDefaults.backend] || "unavailable"})`], ...Object.entries(backendNames)],
+    help: copilot ? "Runs the GitHub Copilot CLI in an isolated, sandboxed COPILOT_HOME." : "",
+  });
+  backendField.querySelector("select").addEventListener("change", () => {
+    saveDialogOptions();
+    renderTaskConfiguration();
+    dialogBody.querySelector('select[name="backend"]')?.focus();
+  });
+  advancedGrid.append(backendField);
   advancedGrid.append(modelField(
-    "model", "Model", options.model, `Default (${taskDefaults.model || "unavailable"})`,
+    "model", "Model", options.model, `Default (${taskDefaults.model || "unavailable"})`, copilot,
   ));
   advancedGrid.append(field("reasoningEffort", "Reasoning effort", {
     type: "select", value: options.reasoningEffort || "",
-    options: [["", `Default (${taskDefaults.reasoningEffort || "unavailable"})`], ...["low", "medium", "high", "xhigh", "max", "ultra"].map(value => [value, value])],
+    options: [["", `Default (${taskDefaults.reasoningEffort || "unavailable"})`], ...efforts.map(value => [value, value])],
   }));
-  advancedGrid.append(field("serviceTier", "Speed / service tier", {
+  if (!copilot) advancedGrid.append(field("serviceTier", "Speed / service tier", {
     type: "select", value: options.serviceTier || (options.fast ? "fast" : "standard"),
     options: [["standard", "Standard"], ["fast", "Fast (higher cost)"], ["ultrafast", "Ultrafast (highest cost; requires model/account support)"]],
   }));
@@ -5010,17 +5083,17 @@ function renderTaskConfiguration(errorMessage = "") {
     }));
   }
   if (["solve", "write", "revise"].includes(task.action)) {
-    advancedGrid.append(modelField("reviewModel", "Critic model", options.reviewModel, "Inherit primary model"));
+    advancedGrid.append(modelField("reviewModel", "Critic model", options.reviewModel, "Inherit primary model", copilot));
     advancedGrid.append(field("reviewReasoningEffort", "Critic reasoning", {
       type: "select", value: options.reviewReasoningEffort || "",
-      options: [["", "Inherit"], ...["low", "medium", "high", "xhigh", "max", "ultra"].map(value => [value, value])],
+      options: [["", "Inherit"], ...efforts.map(value => [value, value])],
     }));
     advancedGrid.append(field("reviewWebSearch", "Critic web search", {
       type: "select", value: options.reviewWebSearch || "",
       options: [["", "Inherit"], ["live", "Live"], ["indexed", "Indexed"], ["disabled", "Disabled"]],
     }));
   }
-  advancedGrid.append(field("codexHome", "CODEX_HOME", {
+  if (!copilot) advancedGrid.append(field("codexHome", "CODEX_HOME", {
     value: options.codexHome || "", placeholder: "~/.codex", full: true,
     help: "Leave blank to inherit the server's CODEX_HOME or default. Dry runs warn if the selected or default home directory is missing. ~ expands to the server's HOME directory.",
   }));

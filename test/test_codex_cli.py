@@ -4,20 +4,25 @@ import os
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import tomllib
 import unittest
 from unittest.mock import Mock, patch
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import codex_cli
+import copilot_fetch_mcp
 
 
 class CodexCliTests(unittest.TestCase):
     def setUp(self):
+        codex_cli.select_backend("codex")
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.codex_home = Path(temporary.name)
@@ -571,6 +576,618 @@ name = "Ignored provider"
         self.assertEqual(completed.returncode, 126)
         self.assertTrue(structured)
         self.assertFalse(timed_out)
+
+
+class CopilotFetchServerTests(unittest.TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def test_refuses_local_and_private_addresses(self):
+        for host in ("127.0.0.1", "localhost", "10.1.2.3", "192.168.0.1", "169.254.169.254", "::1"):
+            with self.assertRaisesRegex(copilot_fetch_mcp.FetchError, "non-public"):
+                copilot_fetch_mcp.public_address(host, 80)
+        for url in ("file:///etc/passwd", "ftp://example.com/", "http://user:pw@example.com/"):
+            with self.assertRaises(copilot_fetch_mcp.FetchError):
+                copilot_fetch_mcp.fetch(url)
+
+    def test_save_as_stays_inside_the_workspace(self):
+        saved = copilot_fetch_mcp.save_body(self.root, "papers/a.pdf", b"%PDF-")
+        self.assertEqual(saved.read_bytes(), b"%PDF-")
+        for path in ("../escape", "a/../../escape", str(self.root / "abs"), "."):
+            with self.assertRaises(copilot_fetch_mcp.FetchError):
+                copilot_fetch_mcp.save_body(self.root, path, b"x")
+        self.assertFalse((self.root.parent / "escape").exists())
+
+    def test_html_becomes_text_with_absolute_links(self):
+        html = b"<html><head><script>x()</script></head><body><h1>Title</h1><p>See <a href='/abs/1'>paper</a>.</p></body></html>"
+        text = copilot_fetch_mcp.body_text("https://arxiv.org/list", "text/html", html)
+        self.assertIn("Title", text)
+        self.assertIn("paper <https://arxiv.org/abs/1>", text)
+        self.assertNotIn("x()", text)
+        self.assertIsNone(copilot_fetch_mcp.body_text("u", "application/pdf", b"%PDF-\0"))
+
+    def test_serves_mcp_over_stdio(self):
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "fetch_url", "arguments": {"url": "http://127.0.0.1:9/"}}},
+        ]
+        output = StringIO()
+        copilot_fetch_mcp.serve(
+            self.root, StringIO("".join(json.dumps(r) + "\n" for r in requests)), output
+        )
+        replies = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
+        self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual(
+            [tool["name"] for tool in replies[1]["result"]["tools"]], ["fetch_url"]
+        )
+        self.assertTrue(replies[2]["result"]["isError"])
+        self.assertIn("non-public", replies[2]["result"]["content"][0]["text"])
+
+
+class CopilotBackendTests(unittest.TestCase):
+    def setUp(self):
+        codex_cli.select_backend("copilot")
+        self.addCleanup(codex_cli.select_backend, "codex")
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def command(self, web_search="disabled", **options):
+        return codex_cli.build_copilot_command(
+            copilot="copilot",
+            workspace=self.root,
+            options=codex_cli.ModelOptions(**options),
+            usage_path=self.root / "usage.json",
+            web_search=web_search,
+        )
+
+    def test_command_runs_sandboxed_non_interactive_json_turn(self):
+        command = self.command(model="gpt-5.5", reasoning_effort="high")
+        for flag in (
+            "--allow-all-tools",
+            "--no-ask-user",
+            "--no-custom-instructions",
+            "--sandbox",
+            "--disable-builtin-mcps",
+        ):
+            self.assertIn(flag, command)
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
+        self.assertEqual(command[command.index("-C") + 1], str(self.root))
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.5")
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "high")
+        excluded = command[command.index("--excluded-tools") + 1:]
+        self.assertEqual(excluded, list(codex_cli.COPILOT_EXCLUDED_TOOLS))
+        self.assertIn("web_fetch", excluded)
+        self.assertIn("task", excluded)
+
+    def test_command_hides_credentials_from_agent_shells(self):
+        environment = {
+            "PATH": "bin",
+            "OPENAI_API_KEY": "x",
+            "AWS_SECRET_ACCESS_KEY": "x",
+            "MY_SERVICE_TOKEN": "x",
+            "COPILOT_GH_ACCOUNT_GITHUB_2E_COM_USER": "x",
+            "GIT_CONFIG_KEY_0": "x",
+            "HOME": "x",
+        }
+        command = codex_cli.build_copilot_command(
+            copilot="copilot",
+            workspace=self.root,
+            options=codex_cli.ModelOptions(),
+            usage_path=self.root / "usage.json",
+            environment=environment,
+        )
+        [flag] = [part for part in command if part.startswith("--secret-env-vars=")]
+        hidden = flag.split("=", 1)[1].split(",")
+        self.assertEqual(
+            sorted(hidden),
+            sorted(
+                [
+                    "OPENAI_API_KEY",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "MY_SERVICE_TOKEN",
+                    "COPILOT_GH_ACCOUNT_GITHUB_2E_COM_USER",
+                    *codex_cli.COPILOT_AUTH_ENV_VARS,
+                ]
+            ),
+        )
+        self.assertLess(command.index(flag), command.index("--excluded-tools"))
+
+    def test_web_search_adds_only_the_github_search_tool(self):
+        command = self.command(web_search="live")
+        self.assertNotIn("--disable-builtin-mcps", command)
+        self.assertEqual(
+            command[command.index("--add-github-mcp-tool") + 1],
+            "web_search",
+        )
+        self.assertEqual(command[command.index("--disable-mcp-server") + 1], "githubiq")
+
+    def test_live_web_search_adds_the_public_fetch_server(self):
+        command = self.command(web_search="live")
+        config = json.loads(command[command.index("--additional-mcp-config") + 1])
+        server = config["mcpServers"][codex_cli.COPILOT_FETCH_SERVER]
+        self.assertEqual(server["command"], sys.executable)
+        self.assertEqual(
+            server["args"],
+            [str(codex_cli.COPILOT_FETCH_SERVER_PATH), "--workspace", str(self.root)],
+        )
+        self.assertTrue(codex_cli.COPILOT_FETCH_SERVER_PATH.is_file())
+        self.assertLess(
+            command.index("--additional-mcp-config"), command.index("--excluded-tools")
+        )
+        self.assertIn("web_fetch", command[command.index("--excluded-tools") + 1:])
+        for web_search in ("disabled", "indexed"):
+            self.assertNotIn("--additional-mcp-config", self.command(web_search=web_search))
+
+    def test_rejects_codex_only_options(self):
+        with self.assertRaisesRegex(codex_cli.CodexError, "Fast"):
+            self.command(fast=True)
+        with self.assertRaisesRegex(codex_cli.CodexError, "ultra"):
+            self.command(reasoning_effort="ultra")
+        args = argparse.Namespace(backend="copilot", review_ultrafast=True)
+        with self.assertRaisesRegex(codex_cli.CodexError, "--review-ultrafast"):
+            codex_cli.validate_backend_options(args)
+        args = argparse.Namespace(backend="codex", fast=True, reasoning_effort="ultra")
+        codex_cli.validate_backend_options(args)
+
+    def test_backend_arguments_select_and_forward_the_backend(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--codex", default="codex")
+        codex_cli.add_backend_arguments(parser)
+        args = parser.parse_args([])
+        self.assertEqual(args.backend, "copilot")
+        self.assertEqual(
+            codex_cli.backend_arguments(args),
+            ["--backend", "copilot", "--codex", "codex", "--copilot", "copilot"],
+        )
+        args = parser.parse_args(["--backend", "codex"])
+        codex_cli.configure_backend(args)
+        self.assertFalse(codex_cli.using_copilot())
+
+    def test_sandbox_settings_block_shell_network(self):
+        settings = codex_cli.copilot_sandbox_settings(
+            "disabled",
+            readonly_paths=["C:\\texlive\\2026"],
+        )["sandbox"]
+        self.assertTrue(settings["enabled"])
+        self.assertFalse(settings["allowBypass"])
+        self.assertTrue(settings["allowDevToolAccess"])
+        self.assertFalse(settings["userPolicy"]["network"]["allowOutbound"])
+        self.assertEqual(
+            settings["userPolicy"]["filesystem"]["readonlyPaths"],
+            ["C:\\texlive\\2026"],
+        )
+        self.assertNotIn("sandboxMcpServers", settings)
+        live = codex_cli.copilot_sandbox_settings("live", readonly_paths=[])
+        self.assertFalse(live["sandbox"]["sandboxMcpServers"])
+        self.assertNotIn("filesystem", live["sandbox"]["userPolicy"])
+
+    def test_readonly_paths_find_tex_root_and_extra_paths(self):
+        binary = self.root / "texlive" / "2026" / "bin" / "windows"
+        binary.mkdir(parents=True)
+        (self.root / "texlive" / "texmf-local").mkdir()
+        name = "latexmk.exe" if os.name == "nt" else "latexmk"
+        executable = binary / name
+        executable.write_text("", encoding="utf-8")
+        executable.chmod(0o755)
+        extra = self.root / "extra"
+        paths = codex_cli.copilot_readonly_paths({
+            "PATH": str(binary),
+            "PATHEXT": ".EXE",
+            codex_cli.COPILOT_READONLY_PATHS_ENV: str(extra),
+        })
+        self.assertEqual(
+            paths,
+            [
+                str(self.root / "texlive" / "2026"),
+                str(self.root / "texlive" / "texmf-local"),
+                str(extra),
+            ],
+        )
+
+    def test_isolated_home_keeps_only_account_config(self):
+        source = self.root / "source-home"
+        source.mkdir()
+        (source / "config.json").write_text(
+            "// comment\n"
+            + json.dumps({
+                "lastLoggedInUser": {"login": "octocat"},
+                "loggedInUsers": [{"login": "octocat"}],
+                "mcpServers": {"private": {}},
+            }),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {codex_cli.COPILOT_HOME_ENV: str(source)}):
+            home = codex_cli.prepare_copilot_home("disabled")
+        self.addCleanup(__import__("shutil").rmtree, home, True)
+        config = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(config), {"lastLoggedInUser", "loggedInUsers"})
+        settings = json.loads((home / "settings.json").read_text(encoding="utf-8"))
+        self.assertTrue(settings["sandbox"]["enabled"])
+
+    def test_result_event_completes_turn(self):
+        events = self.root / "events.jsonl"
+        result = self.root / "agent-result.json"
+        result.write_text("{}", encoding="utf-8")
+        events.write_text(
+            json.dumps({"type": "result", "sessionId": "s", "exitCode": 0}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(codex_cli.structured_turn_is_complete(events, result))
+        events.write_text(
+            json.dumps({"type": "result", "sessionId": "s", "exitCode": 1}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(codex_cli.structured_turn_is_complete(events, result))
+
+    def test_usage_event_reports_codex_comparable_tokens(self):
+        events = self.root / "events.jsonl"
+        events.write_text(
+            json.dumps({"type": "result", "sessionId": "session-1", "exitCode": 0})
+            + "\n",
+            encoding="utf-8",
+        )
+        usage = self.root / "usage.json"
+        usage.write_text(json.dumps({
+            "currentModel": "gpt-5.5",
+            "totalNanoAiu": 1234,
+            "totalPremiumRequestCost": 1,
+            "modelMetrics": {
+                "gpt-5.5": {"usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "cacheReadTokens": 60,
+                    "cacheWriteTokens": 10,
+                    "reasoningTokens": 5,
+                }},
+            },
+        }), encoding="utf-8")
+        codex_cli.append_copilot_usage_event(usage, events)
+        event = json.loads(events.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(event["type"], codex_cli.COPILOT_USAGE_EVENT)
+        self.assertEqual(event["session_id"], "session-1")
+        self.assertEqual(event["model"], "gpt-5.5")
+        self.assertEqual(event["nano_aiu"], 1234)
+        self.assertEqual(event["usage"], {
+            "input_tokens": 100,
+            "cached_input_tokens": 60,
+            "cache_write_input_tokens": 10,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
+        })
+        missing = self.root / "missing.json"
+        self.assertIsNone(codex_cli.copilot_usage_event(missing, events))
+
+    def test_recovers_result_from_final_message(self):
+        events = self.root / "events.jsonl"
+        result = self.root / "agent-result.json"
+        events.write_text(
+            "\n".join(
+                json.dumps({"type": "assistant.message", "data": {"content": text}})
+                for text in ("working", '```json\n{"status": "done"}\n```')
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        codex_cli.recover_copilot_result(events, result)
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8")), {"status": "done"})
+        result.write_text('{"status": "written"}', encoding="utf-8")
+        codex_cli.recover_copilot_result(events, result)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {"status": "written"},
+        )
+
+    def test_result_instructions_reference_workspace_files(self):
+        prompt = codex_cli.with_copilot_result_instructions(
+            "Do the task.",
+            workspace=self.root,
+            schema_path=self.root / "schema.json",
+            result_path=self.root / "agent-result.json",
+        )
+        self.assertTrue(prompt.startswith("Do the task."))
+        self.assertIn("`agent-result.json`", prompt)
+        self.assertIn("`schema.json`", prompt)
+
+    def test_detects_credit_errors(self):
+        events = self.root / "events.jsonl"
+        events.write_text(
+            json.dumps({
+                "type": "session.error",
+                "data": {"message": "You have exceeded your premium request limit."},
+            })
+            + "\n"
+            + json.dumps({
+                "type": "assistant.message",
+                "data": {"content": "quota exceeded is a phrase"},
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIn("premium request limit", codex_cli.agent_credit_error(events))
+        events.write_text(
+            json.dumps({"type": "assistant.message", "data": {"content": "quota exceeded"}})
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIsNone(codex_cli.agent_credit_error(events))
+
+    def test_structured_run_uses_isolated_home_and_folds_usage(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        schema = workspace / "schema.json"
+        schema.write_text("{}", encoding="utf-8")
+        seen = {}
+
+        def fake_run(command, *, prompt, environment, events, events_path, **_):
+            home = Path(environment[codex_cli.COPILOT_HOME_ENV])
+            seen["home"] = home
+            seen["command"] = command
+            seen["prompt"] = prompt
+            self.assertTrue((home / "settings.json").is_file())
+            usage = Path(command[command.index("--usage-output-file") + 1])
+            usage.write_text(json.dumps({
+                "currentModel": "gpt-5.5",
+                "modelMetrics": {"gpt-5.5": {"usage": {
+                    "inputTokens": 3,
+                    "outputTokens": 2,
+                }}},
+            }), encoding="utf-8")
+            for event in (
+                {"type": "assistant.message", "data": {"content": '{"ok": true}'}},
+                {"type": "result", "sessionId": "abc", "exitCode": 0},
+            ):
+                events.write(json.dumps(event) + "\n")
+            events.flush()
+            return subprocess.CompletedProcess(command, 0), True, False
+
+        with (
+            patch.object(codex_cli, "_run_codex_process", side_effect=fake_run),
+            patch.object(codex_cli, "wait_for_codex_launch_slot"),
+        ):
+            result = codex_cli.run_structured_codex(
+                codex="copilot",
+                workspace=workspace,
+                prompt="Solve it.",
+                schema_path=schema,
+                timeout_seconds=60,
+            )
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8")), {"ok": True})
+        self.assertEqual(seen["command"][0], "copilot")
+        self.assertIn("agent-result.json", seen["prompt"])
+        self.assertFalse(seen["home"].exists())
+        lines = (workspace / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        first, last = json.loads(lines[0]), json.loads(lines[-1])
+        self.assertEqual(first["type"], codex_cli.COPILOT_STARTED_EVENT)
+        self.assertEqual(last["type"], codex_cli.COPILOT_USAGE_EVENT)
+        self.assertEqual(last["invocation_id"], first["invocation_id"])
+        self.assertEqual(last["session_id"], "abc")
+        self.assertEqual(last["usage"]["input_tokens"], 3)
+
+    def test_command_pins_session_id_before_variadic_exclusions(self):
+        command = codex_cli.build_copilot_command(
+            copilot="copilot",
+            workspace=self.root,
+            options=codex_cli.ModelOptions(),
+            usage_path=self.root / "usage.json",
+            session_id="1234",
+        )
+        self.assertEqual(command[command.index("--session-id") + 1], "1234")
+        self.assertLess(command.index("--session-id"), command.index("--excluded-tools"))
+        self.assertNotIn("--session-id", self.command())
+
+    def test_detects_network_failures_only_in_new_output(self):
+        events = self.root / "events.jsonl"
+        log = self.root / "run.log"
+        old = json.dumps({
+            "type": "session.error",
+            "data": {"message": "dns error: No such host is known [ENOTFOUND]"},
+        }) + "\n"
+        events.write_text(old, encoding="utf-8")
+        log.write_text("", encoding="utf-8")
+        self.assertIn("ENOTFOUND", codex_cli.copilot_network_failure(events, log))
+        self.assertIsNone(
+            codex_cli.copilot_network_failure(
+                events, log, events_offset=len(old.encode())
+            )
+        )
+        with events.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "type": "session.error",
+                "data": {"message": "The model refused the request."},
+            }) + "\n")
+            stream.write(json.dumps({
+                "type": "tool.execution_complete",
+                "data": {"result": "fetch failed: ECONNRESET"},
+            }) + "\n")
+        self.assertIsNone(
+            codex_cli.copilot_network_failure(
+                events, log, events_offset=len(old.encode())
+            )
+        )
+        log.write_text(
+            "Authentication token found but could not be validated: "
+            "network fetch failed\n",
+            encoding="utf-8",
+        )
+        self.assertIn(
+            "network fetch failed",
+            codex_cli.copilot_network_failure(
+                events, log, events_offset=events.stat().st_size
+            ),
+        )
+
+    def run_with_processes(self, *processes, network=True):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        schema = workspace / "schema.json"
+        schema.write_text("{}", encoding="utf-8")
+        calls = []
+
+        def fake_run(command, *, prompt, events, log, **_):
+            calls.append((command, prompt))
+            usage = Path(command[command.index("--usage-output-file") + 1])
+            return processes[len(calls) - 1](usage, events, log)
+
+        with (
+            patch.object(codex_cli, "_run_codex_process", side_effect=fake_run),
+            patch.object(codex_cli, "wait_for_codex_launch_slot"),
+            patch.object(codex_cli, "wait_for_network", return_value=network) as wait,
+        ):
+            try:
+                codex_cli.run_structured_codex(
+                    codex="copilot",
+                    workspace=workspace,
+                    prompt="Solve it.",
+                    schema_path=schema,
+                    timeout_seconds=60,
+                )
+                error = None
+            except codex_cli.CodexError as exc:
+                error = exc
+        return workspace, calls, wait, error
+
+    @staticmethod
+    def write_events(events, *items):
+        for item in items:
+            events.write(json.dumps(item) + "\n")
+        events.flush()
+
+    @staticmethod
+    def write_usage(usage, input_tokens):
+        usage.write_text(json.dumps({
+            "currentModel": "gpt-5.5",
+            "modelMetrics": {"gpt-5.5": {"usage": {"inputTokens": input_tokens}}},
+        }), encoding="utf-8")
+
+    def test_network_loss_resumes_the_same_session(self):
+        def dropped(usage, events, log):
+            self.write_usage(usage, 5)
+            self.write_events(
+                events,
+                {"type": "user.message", "data": {"content": "Solve it."}},
+                {"type": "session.error", "data": {
+                    "message": "error sending request for url: dns error [ENOTFOUND]",
+                }},
+                {"type": "result", "sessionId": "s", "exitCode": 1},
+            )
+            return subprocess.CompletedProcess([], 1), False, False
+
+        def resumed(usage, events, log):
+            self.write_usage(usage, 8)
+            self.write_events(
+                events,
+                {"type": "assistant.message", "data": {"content": '{"ok": true}'}},
+                {"type": "result", "sessionId": "s", "exitCode": 0},
+            )
+            return subprocess.CompletedProcess([], 0), True, False
+
+        workspace, calls, wait, error = self.run_with_processes(dropped, resumed)
+        self.assertIsNone(error)
+        self.assertEqual(len(calls), 2)
+        wait.assert_called_once()
+        first, second = (command for command, _ in calls)
+        self.assertEqual(first, second)
+        self.assertIn("--session-id", first)
+        self.assertIn("agent-result.json", calls[0][1])
+        self.assertEqual(calls[1][1], codex_cli.COPILOT_RESUME_PROMPT)
+        self.assertEqual(
+            json.loads((workspace / "agent-result.json").read_text(encoding="utf-8")),
+            {"ok": True},
+        )
+        events = [
+            json.loads(line)
+            for line in (workspace / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        types = [event["type"] for event in events]
+        self.assertEqual(types.count(codex_cli.COPILOT_STARTED_EVENT), 1)
+        self.assertEqual(types.count(codex_cli.COPILOT_USAGE_EVENT), 1)
+        self.assertEqual(events[-1]["usage"]["input_tokens"], 8)
+        log = (workspace / "run.log").read_text(encoding="utf-8")
+        self.assertIn("network resume 1/", log)
+
+    def test_offline_startup_reruns_the_original_prompt(self):
+        def offline(usage, events, log):
+            log.write(
+                "Error: Authentication token found but could not be validated "
+                "(network fetch failed)\n"
+            )
+            log.flush()
+            return subprocess.CompletedProcess([], 1), False, False
+
+        def online(usage, events, log):
+            self.write_events(
+                events,
+                {"type": "user.message", "data": {"content": "Solve it."}},
+                {"type": "assistant.message", "data": {"content": '{"ok": true}'}},
+                {"type": "result", "sessionId": "s", "exitCode": 0},
+            )
+            return subprocess.CompletedProcess([], 0), True, False
+
+        _, calls, _, error = self.run_with_processes(offline, online)
+        self.assertIsNone(error)
+        self.assertEqual(calls[0][1], calls[1][1])
+
+    def test_other_failures_and_lasting_outages_do_not_resume(self):
+        def refused(usage, events, log):
+            self.write_events(
+                events,
+                {"type": "user.message", "data": {"content": "Solve it."}},
+                {"type": "session.error", "data": {"message": "Model refused."}},
+            )
+            return subprocess.CompletedProcess([], 1), False, False
+
+        _, calls, wait, error = self.run_with_processes(refused)
+        self.assertIn("exited with status 1", str(error))
+        self.assertEqual(len(calls), 1)
+        wait.assert_not_called()
+
+        def dropped(usage, events, log):
+            self.write_events(events, {"type": "session.error", "data": {
+                "message": "socket hang up",
+            }})
+            return subprocess.CompletedProcess([], 1), False, False
+
+        shutil.rmtree(self.root / "workspace")
+        workspace, calls, wait, error = self.run_with_processes(dropped, network=False)
+        self.assertIn("exited with status 1", str(error))
+        self.assertEqual(len(calls), 1)
+        wait.assert_called_once()
+        self.assertIn(
+            "network did not return",
+            (workspace / "run.log").read_text(encoding="utf-8"),
+        )
+
+    def test_usage_falls_back_to_last_snapshot_with_metrics(self):
+        usage = self.root / "usage.json"
+        events = self.root / "events.jsonl"
+        events.write_text("", encoding="utf-8")
+        self.write_usage(usage, 7)
+        codex_cli.snapshot_copilot_usage(usage)
+        usage.write_text("{}", encoding="utf-8")
+        codex_cli.snapshot_copilot_usage(usage)
+        codex_cli.append_copilot_usage_event(usage, events, "inv")
+        event = json.loads(events.read_text(encoding="utf-8"))
+        self.assertEqual(event["usage"]["input_tokens"], 7)
+
+    def test_wait_for_network_treats_http_errors_as_reachable(self):
+        error = urllib.error.HTTPError(
+            codex_cli.COPILOT_NETWORK_PROBE_URL, 403, "Forbidden", {}, None
+        )
+        with patch.object(urllib.request, "urlopen", side_effect=error):
+            self.assertTrue(codex_cli.wait_for_network(0))
+        with (
+            patch.object(urllib.request, "urlopen", side_effect=OSError("offline")),
+            patch.object(codex_cli.time, "sleep") as sleep,
+        ):
+            self.assertFalse(codex_cli.wait_for_network(0))
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

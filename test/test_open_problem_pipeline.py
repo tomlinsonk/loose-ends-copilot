@@ -371,6 +371,7 @@ class OpenProblemPipelineTests(unittest.TestCase):
             )
 
     def setUp(self):
+        codex_cli.select_backend("codex")
         patcher = patch.object(codex_cli, "grant_sandbox_read_access")
         patcher.start()
         self.addCleanup(patcher.stop)

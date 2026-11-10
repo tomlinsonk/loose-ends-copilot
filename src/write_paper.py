@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import filecmp
 import hashlib
 import json
 import os
@@ -62,6 +63,18 @@ MANUSCRIPT_LABEL_PREFIXES = {
     "definition": "def:",
 }
 FINDING_ID_RE = re.compile(r"^P-[0-9]{3,}$")
+INTERRUPTED_EVENTS = "interrupted-events.jsonl"
+INTERRUPTED_LOG = "interrupted-run.log"
+CONTINUATION_NOTE = (
+    "# Continuing an interrupted run\n\n"
+    "A previous writer run in this working directory was interrupted before "
+    "it finished. Its files are still here. Inspect them first and reuse "
+    "every correct piece of finished work (for example `main.tex`, "
+    "`references.bib`, `readiness.md`, `figures/`, and `code/`) instead of "
+    "starting over. Background commands from that run are no longer running. "
+    "Complete whatever remains, then satisfy every requirement above, "
+    "including validation and the final result."
+)
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PAPER_STATUSES = ("draft_complete", "blocked")
 PAPER_VERDICTS = (
@@ -1659,6 +1672,87 @@ def _install_draft(
     return DraftRef(destination, draft_number, result)
 
 
+def _staged_inputs_match(fresh: Path, existing: Path) -> bool:
+    """Return whether every freshly staged input is unchanged in a run."""
+    for source in fresh.rglob("*"):
+        if not source.is_file():
+            continue
+        target = existing / source.relative_to(fresh)
+        try:
+            if not target.is_file() or not filecmp.cmp(source, target, shallow=False):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def find_interrupted_run(
+    manuscript_directory: Path,
+    inputs: Sequence[PaperInput],
+    *,
+    previous: DraftRef | None,
+) -> Path | None:
+    """Find the newest preserved writer workspace staged from these inputs."""
+    try:
+        candidates = sorted(
+            (
+                path
+                for path in manuscript_directory.glob(".write-run-*")
+                if (path / "inputs" / "index.json").is_file()
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    with tempfile.TemporaryDirectory(
+        prefix="loose-ends-write-check-",
+        ignore_cleanup_errors=True,
+    ) as temporary:
+        fresh = stage_paper_context(Path(temporary), inputs, manuscript=previous)
+        for candidate in candidates:
+            if _staged_inputs_match(fresh, candidate / "inputs"):
+                return candidate.resolve()
+    return None
+
+
+def _set_aside_interrupted_logs(workspace: Path) -> None:
+    for name, destination in (
+        ("events.jsonl", INTERRUPTED_EVENTS),
+        ("run.log", INTERRUPTED_LOG),
+    ):
+        source = workspace / name
+        if not source.is_file():
+            continue
+        with source.open("rb") as current, (workspace / destination).open(
+            "ab"
+        ) as kept:
+            shutil.copyfileobj(current, kept)
+        source.unlink()
+
+
+def _merge_interrupted_logs(workspace: Path) -> None:
+    """Put interrupted-run logs ahead of the continuing run's logs."""
+    for name, source_name in (
+        ("events.jsonl", INTERRUPTED_EVENTS),
+        ("run.log", INTERRUPTED_LOG),
+    ):
+        source = workspace / source_name
+        if not source.is_file():
+            continue
+        target = workspace / name
+        current = target.read_bytes() if target.is_file() else b""
+        earlier = source.read_bytes()
+        if earlier and not earlier.endswith(b"\n"):
+            earlier += b"\n"
+        if name == "run.log":
+            earlier += b"\n--- continued after interruption ---\n"
+        target.write_bytes(earlier + current)
+        source.unlink()
+
+
 def run_author_round(
     manuscript_directory: Path,
     inputs: Sequence[PaperInput],
@@ -1677,14 +1771,28 @@ def run_author_round(
     options: codex_cli.ModelOptions,
     web_search: str = "live",
     launch_interval: float = codex_cli.CODEX_LAUNCH_INTERVAL_SECONDS,
+    continue_interrupted: bool = False,
 ) -> DraftRef:
     manuscript_directory.mkdir(parents=True, exist_ok=True)
-    workspace = Path(
-        tempfile.mkdtemp(prefix=".write-run-", dir=manuscript_directory)
-    ).resolve()
+    workspace = (
+        find_interrupted_run(manuscript_directory, inputs, previous=previous)
+        if continue_interrupted
+        else None
+    )
+    continuing = workspace is not None
+    if workspace is not None:
+        _set_aside_interrupted_logs(workspace)
+        print(f"Continuing interrupted run: {workspace}", flush=True)
+    else:
+        workspace = Path(
+            tempfile.mkdtemp(prefix=".write-run-", dir=manuscript_directory)
+        ).resolve()
     draft_number = next_draft_number(manuscript_directory)
     try:
-        context = stage_paper_context(workspace, inputs, manuscript=previous)
+        if continuing:
+            context = workspace / "inputs"
+        else:
+            context = stage_paper_context(workspace, inputs, manuscript=previous)
         prompt = render_writer_prompt(
             prompt_template,
             context=context,
@@ -1693,6 +1801,8 @@ def run_author_round(
             previous=previous,
             revision_instruction=revision_instruction,
         )
+        if continuing:
+            prompt = prompt.rstrip() + "\n\n" + CONTINUATION_NOTE + "\n"
         expectations = {
             "result_ids": [item.result_id for item in inputs],
             "claim_ids_by_result": {
@@ -1725,6 +1835,8 @@ def run_author_round(
             launch_interval=launch_interval,
         )
         result = codex_cli.validated_result(report)
+        if continuing:
+            _merge_interrupted_logs(workspace)
         generated = [
             path
             for path in report.files
@@ -2029,6 +2141,7 @@ def run_pipeline(
     force_author_round: bool = False,
     web_search: str = "live",
     review_web_search: str = "live",
+    continue_interrupted: bool = False,
 ) -> PipelineOutcome:
     drafts: list[DraftRef] = []
     final_review: PaperReview | None = None
@@ -2098,6 +2211,7 @@ def run_pipeline(
             config_digest=config_digest,
             options=options,
             web_search=web_search,
+            continue_interrupted=continue_interrupted,
         )
         drafts.append(draft)
         author_round_name = "revision" if is_revision else "draft"
@@ -2319,10 +2433,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate and report the manuscript plan without starting Codex",
     )
     parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "start a new writer workspace instead of continuing an "
+            "interrupted run staged from the same inputs"
+        ),
+    )
+    parser.add_argument(
         "--codex",
         default="codex",
         help="Codex CLI executable or command name (default: codex)",
     )
+    codex_cli.add_backend_arguments(parser)
     parser.add_argument(
         "--latexmk",
         default="latexmk",
@@ -2358,6 +2481,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        codex_cli.configure_backend(args)
         if bool(args.attempts) == bool(args.revise):
             raise common.CodexError(
                 "provide one or more paper/problem/attempt directories, or "
@@ -2482,12 +2606,23 @@ def main(argv: list[str] | None = None) -> int:
             f"Would create and independently review at most "
             f"{args.max_rounds} new draft(s)."
         )
+        if not args.fresh and manuscript_directory.is_dir():
+            try:
+                interrupted = find_interrupted_run(
+                    manuscript_directory,
+                    inputs,
+                    previous=previous,
+                )
+            except (common.CodexError, OSError) as exc:
+                return codex_cli.report_error(parser, exc)
+            if interrupted is not None:
+                print(f"Would continue interrupted run: {interrupted}")
         if args.revision_instruction is not None:
             print(f"Writer direction: {args.revision_instruction}")
         return 0
 
     try:
-        codex = codex_cli.resolve_codex_executable(args.codex)
+        codex = codex_cli.agent_executable(args)
         codex_version = codex_cli.read_codex_version(codex)
         latexmk = resolve_latexmk(args.latexmk)
         manuscript_directory.mkdir(parents=True, exist_ok=True)
@@ -2535,6 +2670,7 @@ def main(argv: list[str] | None = None) -> int:
             force_author_round=selection_changed,
             web_search=args.web_search,
             review_web_search=review_web_search,
+            continue_interrupted=not args.fresh,
         )
     except (common.CodexError, OSError) as exc:
         print(f"Paper writing failed: {exc}", file=sys.stderr)

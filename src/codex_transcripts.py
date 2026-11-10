@@ -86,6 +86,9 @@ def record_transcript(function):
                 "reasoning_effort": options.reasoning_effort,
                 "service_tier": options.service_tier,
             })
+        from codex_cli import active_backend
+
+        sources["backend"] = active_backend()
         (folder / "prompt.txt").write_text(kwargs["prompt"], encoding="utf-8")
         sources["started_at"] = time.time()
         started = time.monotonic()

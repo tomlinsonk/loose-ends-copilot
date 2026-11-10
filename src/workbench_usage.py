@@ -1,4 +1,4 @@
-"""Persistent, rebuildable token accounting for saved Codex invocations.
+"""Persistent, rebuildable token accounting for saved agent invocations.
 
 Logs are imported in the background, never on a summary request. Thread/turn
 IDs deduplicate archived, installed, and merged repair logs. The index retains
@@ -37,7 +37,9 @@ TOKEN_FIELDS = (
     "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
     "output_tokens", "reasoning_output_tokens",
 )
-EVENT_RE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"(thread.started|turn.started|turn.completed|turn.failed|error)"')
+EVENT_RE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"(thread.started|turn.started|turn.completed|turn.failed|error|result|loose_ends.copilot_started|loose_ends.copilot_usage)"')
+COPILOT_STARTED_EVENT = "loose_ends.copilot_started"
+COPILOT_USAGE_EVENT = "loose_ends.copilot_usage"
 ENTITY_RE = re.compile(r"^(OP-\d+|attempt-\d+|draft-\d+)$")
 
 
@@ -219,7 +221,7 @@ class UsageIndex:
 
     def _installed_context(self, events):
         prefix = events.name.removesuffix("events.jsonl")
-        if prefix == "repair-":
+        if prefix in {"repair-", "interrupted-"}:
             prefix = ""
         manifest = self._json(events.parent / f"{prefix}manifest.json")
         if prefix == "review-" and events.parent.name.startswith("draft-"):
@@ -424,18 +426,37 @@ class UsageIndex:
                     except ValueError:
                         continue
                     kind = event["type"]
+                    # Copilot turns are bracketed by host-written start and
+                    # usage events; Copilot's own result event marks success.
+                    if kind == COPILOT_STARTED_EVENT:
+                        state = {"copilot": event.get("invocation_id") or f"source:{key}"}
+                        records[f"copilot:{state['copilot']}"] = (None, False, None)
+                        continue
+                    if kind == "result":
+                        if "copilot" in state and event.get("exitCode") == 0:
+                            state["completed"] = True
+                        continue
+                    if kind == COPILOT_USAGE_EVENT:
+                        invocation = event.get("invocation_id") or state.get("copilot") or f"source:{key}"
+                        model = event.get("model") if isinstance(event.get("model"), str) else None
+                        records[f"copilot:{invocation}"] = (
+                            token_usage(event.get("usage")),
+                            bool(state.get("completed")),
+                            model,
+                        )
+                        continue
                     if kind == "thread.started":
                         state = {"thread": event.get("thread_id") or f"source:{key}", "turn": 0}
-                        records[f"{state['thread']}:1"] = (None, False)
+                        records[f"{state['thread']}:1"] = (None, False, None)
                         continue
                     if kind == "turn.started":
                         state["turn"] = state.get("turn", 0) + 1
                     identity = f"{state.get('thread', 'source:' + key)}:{max(1, state.get('turn', 1))}"
                     usage = token_usage(event.get("usage")) if kind == "turn.completed" else None
                     if identity not in records or usage is not None:
-                        records[identity] = (usage, kind == "turn.completed")
+                        records[identity] = (usage, kind == "turn.completed", None)
                 if not records and not state and stat.st_size:
-                    records[f"source:{key}:1"] = (None, False)
+                    records[f"source:{key}:1"] = (None, False, None)
                 stream.seek(max(0, offset - 128))
                 tail_digest = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
         except OSError:
@@ -443,7 +464,7 @@ class UsageIndex:
         if self.stopping.is_set():
             return 0  # Do not mark an interrupted import as fully consumed.
         with self.store.connect() as db:
-            for identity, (usage, completed) in records.items():
+            for identity, (usage, completed, reported_model) in records.items():
                 db.execute("""INSERT INTO usage_invocations
                     (id, stage, model, tier, quality, usage_json, completed)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -458,7 +479,7 @@ class UsageIndex:
                     quality = MAX(quality, excluded.quality),
                     usage_json = COALESCE(excluded.usage_json, usage_json),
                     completed = MAX(completed, excluded.completed)
-                    """, (identity, context["stage"], context.get("model"), context.get("tier"),
+                    """, (identity, context["stage"], reported_model or context.get("model"), context.get("tier"),
                           context["quality"], json.dumps(usage) if usage is not None else None, int(completed)))
                 db.executemany("INSERT OR IGNORE INTO usage_scopes VALUES (?, ?, ?)",
                                [(identity, kind, path) for kind, path in context["scopes"]])

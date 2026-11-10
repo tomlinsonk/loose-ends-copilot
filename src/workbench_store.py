@@ -61,12 +61,86 @@ def _resources_conflict(left: Iterable[str], right: Iterable[str]) -> bool:
     return False
 
 
+def _target_paper_names(targets: object) -> set[str] | None:
+    """Return each target's paper directory name, or None if any is unknown."""
+    if not isinstance(targets, list) or not targets:
+        return None
+    names: set[str] = set()
+    for target in targets:
+        if not isinstance(target, dict) or not isinstance(target.get("path"), str):
+            return None
+        parts = target["path"].replace("\\", "/").rstrip("/").split("/")
+        depth = {"paper": 1, "problem": 2, "attempt": 3}.get(target.get("kind"))
+        if depth is None or len(parts) < depth or not parts[-depth]:
+            return None
+        names.add(parts[-depth])
+    return names
+
+
+def write_manuscript_resources(
+    output_directory: str,
+    targets: object,
+    name: str | None = None,
+) -> set[str]:
+    """Lock a new manuscript without serializing unrelated writes.
+
+    A derived manuscript name lists every paper it draws on, so two writes
+    can only derive the same name when they share a paper directory name.
+    """
+    output = output_directory.replace("\\", "/").rstrip("/")
+    papers = _target_paper_names(targets)
+    if papers is None:
+        return {f"manuscript:{output_directory}"}
+    resources = {f"manuscript-paper:{output}/{paper}" for paper in papers}
+    if name is not None:
+        resources.add(f"manuscript:{output}/{name}")
+    return resources
+
+
+def _option_value(argv: list, option: str) -> str | None:
+    try:
+        value = argv[argv.index(option) + 1]
+    except (ValueError, IndexError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _refine_write_resources(row: sqlite3.Row, stored: set[str], targets) -> set[str]:
+    """Narrow the folder-wide manuscript lock saved by older versions."""
+    if "argv_json" not in row.keys():
+        return stored
+    try:
+        argv = json.loads(row["argv_json"])
+    except (TypeError, json.JSONDecodeError):
+        return stored
+    if (
+        not isinstance(argv, list)
+        or "--revise" in argv
+        or not any(
+            isinstance(item, str) and item.replace("\\", "/").endswith("/write_paper.py")
+            for item in argv
+        )
+    ):
+        return stored
+    output = _option_value(argv, "--output-dir")
+    if output is None:
+        return stored
+    folder = _resource_identity(f"manuscript:{output}")
+    old = {resource for resource in stored if _resource_identity(resource) == folder}
+    if not old:
+        return stored
+    return (stored - old) | write_manuscript_resources(
+        output, targets, _option_value(argv, "--name")
+    )
+
+
 def _run_resources(row: sqlite3.Row) -> set[str]:
     """Get precise locks, refining paper-wide locks saved by older versions."""
     stored = set(json.loads(row["resources_json"]))
     targets = json.loads(row["targets_json"])
     if not isinstance(targets, list):
         return stored
+    stored = _refine_write_resources(row, stored, targets)
 
     derived: set[str] = set()
     recognized = False
@@ -829,7 +903,7 @@ class WorkbenchStore:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         with self.connect() as connection:
             rows = connection.execute(
-                f"""SELECT resources_json, targets_json FROM runs
+                f"""SELECT resources_json, targets_json, argv_json FROM runs
                 WHERE status IN ({placeholders})""",
                 tuple(ACTIVE_STATUSES),
             ).fetchall()

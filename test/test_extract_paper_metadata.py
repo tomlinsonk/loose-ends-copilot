@@ -31,7 +31,9 @@ class ExtractPaperMetadataTests(unittest.TestCase):
             )
             output = StringIO()
             with redirect_stdout(output):
-                status = extract_paper_metadata.main([str(paper), "--dry-run"])
+                status = extract_paper_metadata.main(
+                    [str(paper), "--dry-run", "--backend", "codex"]
+                )
 
         self.assertEqual(status, 0)
         self.assertIn("Would ask Codex", output.getvalue())
