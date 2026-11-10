@@ -1,5 +1,7 @@
 # Loose Ends
 
+> Note: this is a fork of Erik Demaine's Loose Ends repo, but adapted to run using GitHub Copilot rather than Codex. This fork allows selecting a backend, but defaults to GitHub Copilot since that's what I'm using.
+
 Loose Ends is a software tool to use Large Language Models (LLMs)
 to solve open problems from existing research papers, and thereby
 "tie up loose ends".
